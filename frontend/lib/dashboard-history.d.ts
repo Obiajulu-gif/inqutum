@@ -33,6 +33,9 @@ export interface DashboardData {
 }
 
 export declare const INVOICE_FILTERS: readonly string[];
+export declare const DASHBOARD_SORT_OPTIONS: readonly string[];
+
+export type DashboardSortBy = 'newest' | 'oldest' | 'amount-desc' | 'amount-asc' | 'status' | string;
 
 export function belongsToSeller(
   invoice: DashboardInvoice | null | undefined,
@@ -51,6 +54,16 @@ export function searchInvoices(
   query: string | null | undefined
 ): DashboardInvoice[];
 
+export function filterInvoicesByStatus(
+  invoices: DashboardInvoice[] | null | undefined,
+  statusFilter: string | null | undefined
+): DashboardInvoice[];
+
+export function sortInvoices(
+  invoices: DashboardInvoice[] | null | undefined,
+  sortBy?: DashboardSortBy
+): DashboardInvoice[];
+
 export function exportableInvoices(
   invoices: DashboardInvoice[] | null | undefined
 ): DashboardInvoice[];
@@ -64,6 +77,12 @@ export function historicalInvoices(
   invoices: DashboardInvoice[] | null | undefined,
   now?: string | number | Date
 ): DashboardInvoice[];
+
+export function isInvoiceCancellable(
+  invoice: DashboardInvoice | null | undefined,
+  sellerPublicKey?: string | null,
+  now?: string | number | Date
+): boolean;
 
 export function emptyDashboardData(): DashboardData;
 
@@ -84,3 +103,4 @@ export function revenueEntries(
 ): Array<[string, number | string]>;
 
 export function hasAnyInvoices(stats: DashboardStats | null | undefined): boolean;
+

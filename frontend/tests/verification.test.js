@@ -7,6 +7,7 @@ const {
   checkPayerInfo,
   resolveVerificationError,
   normalizeTransactionHash,
+  messageForCode,
 } = require('../lib/verification');
 
 const TX_HASH = 'a1b2c3d4'.repeat(8); // 64 hex characters
@@ -88,16 +89,19 @@ test('covers every rejection code with a message', () => {
     'INVALID_PAYER_NAME',
     'INVALID_PAYER_EMAIL',
     'PAYER_INFO_TOO_LONG',
+    'VERIFY_RATE_LIMIT_EXCEEDED',
     'INVOICE_ALREADY_PAID',
     'INVOICE_EXPIRED',
     'INVOICE_NOT_PENDING',
     'TRANSACTION_NOT_FOUND',
+    'TRANSACTION_CLOSE_TIME_UNAVAILABLE',
     'NO_PAYMENT_OPERATION',
     'MEMO_MISMATCH',
     'DESTINATION_MISMATCH',
     'AMOUNT_MISMATCH',
     'ASSET_MISMATCH',
     'NETWORK_MISMATCH',
+    'TX_HASH_ALREADY_USED',
   ];
 
   assert.deepEqual(Object.keys(VERIFICATION_MESSAGES).sort(), codes.sort());
@@ -105,4 +109,10 @@ test('covers every rejection code with a message', () => {
     assert.equal(typeof VERIFICATION_MESSAGES[code], 'string');
     assert.ok(VERIFICATION_MESSAGES[code].length > 0);
   }
+});
+
+test('messageForCode maps a known code and returns nothing for an unknown one', () => {
+  assert.equal(messageForCode('ASSET_MISMATCH'), 'Asset mismatch');
+  assert.equal(messageForCode('SOMETHING_NEW'), undefined);
+  assert.equal(messageForCode(undefined), undefined);
 });

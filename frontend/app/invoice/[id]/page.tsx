@@ -1,31 +1,48 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
+// `apiErrorMessage` resolves stable verification codes to their canonical
+// message, so the invoice error banner never shows divergent copy.
 import { apiErrorMessage, invoiceApi, isApiUnavailableError } from '@/lib/api';
 import QRCodeDisplay from '@/components/QRCodeDisplay';
 import PaymentStatus from '@/components/PaymentStatus';
 import WalletConnect from '@/components/WalletConnect';
 import UserProfile from '@/components/UserProfile';
+import FreighterInstallPrompt from '@/components/FreighterInstallPrompt';
 import PaymentReceipt from '@/components/PaymentReceipt';
-import { formatAmount, formatDate, getTimeRemaining, getShareUrl } from '@/lib/utils';
-import { ArrowLeft, Share2, Loader2, X } from 'lucide-react';
+import AssetLogo from '@/components/AssetLogo';
+import { formatAmount, formatDate, getTimeRemaining } from '@/lib/utils';
+import { MAIN_CONTENT_ID, describeAmount, statusText } from '@/lib/a11y';
+import { ArrowLeft, Share2, Loader2, X, Mail } from 'lucide-react';
 import { toast } from 'sonner';
+import { useWalletStore } from '@/lib/store';
 import ApiErrorState from '@/components/ApiErrorState';
 import { effectiveInvoiceStatus } from '@/lib/invoice-lifecycle';
+import { invoiceSharePath } from '@/lib/invoice-share-path';
+import { useWalletStore } from '@/lib/store';
+import { EXPECTED_WALLET_NETWORK } from '@/lib/stellar';
+import { walletGate } from '@/lib/freighter-availability';
 
 export default function InvoiceDetailPage() {
   const params = useParams();
   const router = useRouter();
   const id = params.id as string;
-
   const [invoice, setInvoice] = useState<any>(null);
   const [paymentInfo, setPaymentInfo] = useState<any>(null);
   const [loading, setLoading] = useState(true);
-  const [userWallet, setUserWallet] = useState<string | null>(null);
+  const { publicKey, connected, network, freighterAvailable } = useWalletStore();
+  const gate = walletGate(
+    { freighterAvailable, connected, publicKey, network },
+    EXPECTED_WALLET_NETWORK
+  );
+  const userWallet = gate.ready ? publicKey : null;
   const [loadError, setLoadError] = useState<string | null>(null);
   const [lifecycleNow, setLifecycleNow] = useState(() => Date.now());
+  // Cancelling reloads the invoice and swaps the status panel out from under
+  // the button that was just pressed, so focus has to be moved deliberately.
+  const statusPanelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const timer = window.setInterval(() => setLifecycleNow(Date.now()), 30_000);
@@ -62,7 +79,7 @@ export default function InvoiceDetailPage() {
   }, [loadInvoice]);
 
   const handleShare = async () => {
-    const url = getShareUrl(invoice.id);
+    const url = `${window.location.origin}${invoiceSharePath(invoice.id)}`;
 
     if (navigator.share) {
       try {
@@ -80,12 +97,21 @@ export default function InvoiceDetailPage() {
     }
   };
 
+  const activeWallet = userWallet || (connected ? publicKey : null);
+
   const handleCancel = async () => {
     if (!window.confirm('Cancel this invoice?')) return;
     try {
-      await invoiceApi.cancel(id);
+      await invoiceApi.cancel(id, activeWallet || invoice?.sellerPublicKey);
       toast.success('Invoice cancelled');
       await loadInvoice();
+      /*
+       * Cancelling unmounts the Cancel button that was just pressed, which
+       * drops focus to the top of the document with no explanation. Focus goes
+       * to the status panel instead, which is also a live region and so states
+       * the new status (issue #289).
+       */
+      statusPanelRef.current?.focus();
     } catch (error) {
       const message = apiErrorMessage(error, 'Failed to cancel invoice');
       if (isApiUnavailableError(error)) setLoadError(message);
@@ -95,15 +121,21 @@ export default function InvoiceDetailPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-logo-pattern relative flex items-center justify-center">
+      <main
+        id={MAIN_CONTENT_ID}
+        tabIndex={-1}
+        className="min-h-screen bg-logo-pattern relative flex items-center justify-center"
+      >
         <div className="orb orb-1"></div>
         <div className="orb orb-2"></div>
         <div className="orb orb-3"></div>
-        <div className="relative">
+        {/* The spinner has no text equivalent on its own. */}
+        <div className="relative" role="status" aria-live="polite">
           <div className="absolute inset-0 bg-gradient-to-r from-cyan-400 to-blue-500 rounded-full blur-2xl opacity-30"></div>
-          <Loader2 className="w-16 h-16 animate-spin text-cyan-400 relative z-10" />
+          <Loader2 className="w-16 h-16 animate-spin text-teal-800 relative z-10" aria-hidden="true" />
+          <span className="sr-only">Loading this invoice.</span>
         </div>
-      </div>
+      </main>
     );
   }
 
@@ -118,14 +150,18 @@ export default function InvoiceDetailPage() {
       );
     }
     return (
-      <div className="min-h-screen bg-logo-pattern relative flex items-center justify-center">
+      <main
+        id={MAIN_CONTENT_ID}
+        tabIndex={-1}
+        className="min-h-screen bg-logo-pattern relative flex items-center justify-center"
+      >
         <div className="orb orb-1"></div>
         <div className="orb orb-2"></div>
         <div className="orb orb-3"></div>
         <div className="card text-center max-w-md relative z-10">
           <h1 className="text-2xl font-bold text-red-600 mb-2">Invoice Not Found</h1>
         </div>
-      </div>
+      </main>
     );
   }
 
@@ -182,7 +218,6 @@ export default function InvoiceDetailPage() {
               )}
             </div>
           </div>
-        </header>
 
         <main id="main-content" className="pt-20">
           {loadError && (
@@ -190,80 +225,110 @@ export default function InvoiceDetailPage() {
               <ApiErrorState message={loadError} onRetry={() => void loadInvoice()} compact />
             </div>
           )}
+
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 sm:gap-8">
             <div className="card">
               <h1 className="text-3xl font-bold text-gray-900 mb-8">Invoice Details</h1>
 
-              <div className="space-y-5">
+              {/*
+                A description list: each of these is a label/value pair, which
+                <dl> states outright rather than leaving to reading order.
+                The amount keeps an explicit name because `bg-clip-text` and
+                the nested span split it into two announcements.
+              */}
+              <dl className="space-y-5">
                 <div className="bg-gradient-to-br from-gray-50 to-slate-50 p-5 rounded-2xl border border-gray-200/50">
-                  <p className="text-xs text-gray-600 mb-2 font-semibold uppercase tracking-wide">Invoice ID</p>
-                  <p className="font-mono text-sm text-gray-900 break-all">{invoice.id}</p>
+                  <dt className="text-xs text-gray-600 mb-2 font-semibold uppercase tracking-wide">Invoice ID</dt>
+                  <dd className="font-mono text-sm text-gray-900 break-all">{invoice.id}</dd>
                 </div>
 
                 <div className="bg-gradient-to-br from-cyan-50 to-blue-50 p-6 rounded-2xl border-2 border-cyan-200/50 shadow-lg">
-                  <p className="text-xs text-gray-600 mb-3 font-semibold uppercase tracking-wide">Amount</p>
-                  <p className="text-4xl sm:text-5xl font-bold bg-gradient-to-r from-cyan-600 to-blue-600 bg-clip-text text-transparent">
-                    {formatAmount(invoice.amount, 7)} <span className="text-2xl">{invoice.assetCode}</span>
-                  </p>
+                  <dt className="text-xs text-gray-600 mb-3 font-semibold uppercase tracking-wide">Amount</dt>
+                  {/*
+                    The value is given as hidden visual text plus a screen
+                    reader equivalent, rather than an `aria-label` on the
+                    <dd> — ARIA prohibits naming a <dd>, and axe reports it.
+                  */}
+                  <dd className="flex items-center gap-3 text-4xl sm:text-5xl font-bold bg-gradient-to-r from-cyan-700 to-blue-700 bg-clip-text text-transparent">
+                    <AssetLogo code={invoice.assetCode || 'XLM'} size={32} showName={false} decorative />
+                    <span aria-hidden="true">
+                      {formatAmount(invoice.amount, 7)} <span className="text-2xl">{invoice.assetCode || 'XLM'}</span>
+                    </span>
+                    <span className="sr-only">
+                      {describeAmount(formatAmount(invoice.amount, 7), invoice.assetCode || 'XLM')}
+                    </span>
+                  </dd>
                 </div>
 
                 {invoice.description && (
                   <div className="border-b pb-4">
-                    <p className="text-sm text-gray-600 mb-1">Description</p>
-                    <p className="text-gray-900">{invoice.description}</p>
+                    <dt className="text-sm text-gray-600 mb-1">Description</dt>
+                    <dd className="text-gray-900">{invoice.description}</dd>
                   </div>
                 )}
 
                 {invoice.customerName && (
                   <div className="border-b pb-4">
-                    <p className="text-sm text-gray-600 mb-1">Client</p>
-                    <p className="text-gray-900">{invoice.customerName}</p>
+                    <dt className="text-sm text-gray-600 mb-1">Client</dt>
+                    <dd className="text-gray-900">{invoice.customerName}</dd>
                   </div>
                 )}
 
                 {invoice.customerEmail && (
                   <div className="border-b pb-4">
-                    <p className="text-sm text-gray-600 mb-1">Client Email</p>
-                    <p className="text-gray-900">{invoice.customerEmail}</p>
+                    <dt className="text-sm text-gray-600 mb-1">Client Email</dt>
+                    <dd className="text-gray-900">{invoice.customerEmail}</dd>
                   </div>
                 )}
 
                 <div className="border-b pb-4">
-                  <p className="text-sm text-gray-600 mb-1">Memo</p>
-                  <p className="font-mono text-sm text-gray-900">{invoice.memo}</p>
+                  <dt className="text-sm text-gray-600 mb-1">Memo</dt>
+                  <dd className="font-mono text-sm text-gray-900">{invoice.memo}</dd>
                 </div>
 
                 <div className="border-b pb-4">
-                  <p className="text-sm text-gray-600 mb-1">Created</p>
-                  <p className="text-gray-900">{formatDate(invoice.createdAt)}</p>
+                  <dt className="text-sm text-gray-600 mb-1">Created</dt>
+                  <dd className="text-gray-900">{formatDate(invoice.createdAt)}</dd>
+                </div>
+
+                {effectiveStatus === 'EXPIRED' && (
+                  <div className="border-b pb-4">
+                    <dt className="text-sm text-gray-600 mb-1">Expired At</dt>
+                    <dd className="text-red-700 font-semibold">{formatDate(invoice.expiresAt)}</dd>
+                  </div>
+                )}
+
+                <div className="border-b pb-4">
+                  <dt className="text-sm text-gray-600 mb-1">Status</dt>
+                  <dd className="text-gray-900 font-semibold">
+                    {statusText(effectiveStatus).label}
+                  </dd>
                 </div>
 
                 {effectiveStatus === 'PENDING' && (
                   <div className="border-b pb-4">
-                    <p className="text-sm text-gray-600 mb-1">Expires In</p>
-                    <p className="text-gray-900 font-semibold">
+                    <dt className="text-sm text-gray-600 mb-1">Expires In</dt>
+                    <dd className="text-gray-900 font-semibold">
                       {getTimeRemaining(invoice.expiresAt)}
-                    </p>
-                  </div>
-                )}
-
-                {effectiveStatus === 'EXPIRED' && (
-                  <div className="border-b pb-4">
-                    <p className="text-sm text-gray-600 mb-1">Expired At</p>
-                    <p className="text-red-700 font-semibold">{formatDate(invoice.expiresAt)}</p>
+                    </dd>
                   </div>
                 )}
 
                 {invoice.paidAt && (
                   <div className="border-b pb-4">
-                    <p className="text-sm text-gray-600 mb-1">Paid At</p>
-                    <p className="text-gray-900">{formatDate(invoice.paidAt)}</p>
+                    <dt className="text-sm text-gray-600 mb-1">Paid At</dt>
+                    <dd className="text-gray-900">{formatDate(invoice.paidAt)}</dd>
                   </div>
                 )}
-              </div>
+              </dl>
             </div>
 
-            <div className="space-y-6">
+            {/*
+              The status side of the page. The wrapper takes focus after a
+              cancel, because that action removes the button it was triggered
+              from and the panel below is the result of it.
+            */}
+            <div className="space-y-6" ref={statusPanelRef} tabIndex={-1}>
               {effectiveStatus !== 'PAID' && (
                 <PaymentStatus status={effectiveStatus} txHash={invoice.paymentTxHash} />
               )}
@@ -274,6 +339,14 @@ export default function InvoiceDetailPage() {
 
               {effectiveStatus === 'PENDING' && paymentInfo?.paymentAvailable !== false && (
                 <div className="card">
+                  {!gate.ready && (
+                    <FreighterInstallPrompt
+                      gate={gate}
+                      action={<WalletConnect />}
+                      compact
+                      className="mb-4"
+                    />
+                  )}
                   <h3 className="text-lg font-semibold mb-4 text-center">
                     Payment QR Code
                   </h3>
@@ -281,6 +354,10 @@ export default function InvoiceDetailPage() {
                     value={paymentInfo.paymentUrl}
                     size={200}
                     showCopy={true}
+                    description={`a payment link for ${describeAmount(
+                      formatAmount(invoice.amount, 7),
+                      invoice.assetCode
+                    )}`}
                   />
                   <Link
                     href={`/pay/${invoice.id}`}

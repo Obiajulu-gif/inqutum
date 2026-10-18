@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { InvalidTransitionError } from '../../shared/invoice-lifecycle.ts';
 import { beforeEach, describe, it } from 'node:test';
 import { calculateInvoiceStats } from '../src/storage/invoice-stats.ts';
 import type { StatsInvoice } from '../src/storage/invoice-stats.ts';
@@ -188,11 +189,14 @@ describe('MemoryStorage parity with Postgres invoice columns', () => {
     assert.equal(reget?.status, 'PAID');
     assert.equal(reget?.payerEmail, 'nayib@payer.example');
 
-    const secondTry = store.markAsPaid(pending.id, 'wxyz'.repeat(16), payerA);
-    assert.equal(secondTry, undefined, 'already-PAID invoice must not accept a second markAsPaid');
+    assert.throws(
+      () => store.markAsPaid(pending.id, 'wxyz'.repeat(16), payerA),
+      InvalidTransitionError,
+      'already-PAID invoice must not accept a second markAsPaid'
+    );
   });
 
-  it('markAsPaid returns undefined once expiresAt passes, same guard as Postgres', () => {
+  it('markAsPaid refuses once expiresAt passes, same guard as Postgres', () => {
     const almostExpired = store.createInvoice({
       sellerPublicKey: sellerA,
       amount: 5,
@@ -200,8 +204,10 @@ describe('MemoryStorage parity with Postgres invoice columns', () => {
       expiresAt: new Date(Date.now() - 1),
     });
 
-    const result = store.markAsPaid(almostExpired.id, '1234'.repeat(16), payerA);
-    assert.equal(result, undefined);
+    assert.throws(
+      () => store.markAsPaid(almostExpired.id, '1234'.repeat(16), payerA),
+      InvalidTransitionError
+    );
 
     const reget = store.getInvoiceById(almostExpired.id);
     assert.equal(reget?.status, 'EXPIRED');
@@ -214,11 +220,26 @@ describe('MemoryStorage parity with Postgres invoice columns', () => {
       memo: 'INV-CANCEL',
     });
 
-    const cancelled = store.updateInvoice(pending.id, { status: 'CANCELLED' });
+    const cancelled = store.cancelInvoice(pending.id, sellerA);
     assert.equal(cancelled?.status, 'CANCELLED');
 
-    const alreadyCancelled = store.updateInvoice(pending.id, { status: 'CANCELLED' });
-    assert.equal(alreadyCancelled?.status, 'CANCELLED');
+    assert.throws(() => store.cancelInvoice(pending.id, sellerA), InvalidTransitionError);
+  });
+
+  it('cancelInvoice throws unauthorized when sellerPublicKey does not match', () => {
+    const pending = store.createInvoice({
+      sellerPublicKey: sellerA,
+      amount: 12,
+      memo: 'INV-CANCEL-AUTH',
+    });
+
+    assert.throws(
+      () => store.cancelInvoice(pending.id, sellerB),
+      /Unauthorized: only the seller can cancel this invoice/
+    );
+
+    const reget = store.getInvoiceById(pending.id);
+    assert.equal(reget?.status, 'PENDING');
   });
 
   it('getAllInvoices + getStats return seller-scoped rows with parity data', () => {

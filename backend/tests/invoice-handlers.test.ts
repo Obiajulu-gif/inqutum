@@ -10,9 +10,9 @@ import memoryStorage from '../src/storage/memory-storage.ts';
 import type { InvoiceStorage } from '../src/storage/invoice-storage.ts';
 import { compareNewestFirst } from '../src/storage/invoice-cursor.ts';
 
-const SELLER_A = 'G' + 'A'.repeat(55);
-const SELLER_B = 'G' + 'B'.repeat(55);
-const PAYER = 'G' + 'C'.repeat(55);
+const SELLER_A = 'GB3Q3VRHH3OQDYITTLONDLEHWQGKB27T2BEDSFHIUMOERULVXPDXRKG4';
+const SELLER_B = 'GB6IHEZ4QNOHJZRYRFLOC45P4SK3KKL6KNPI5WEG6FNVSZ2K5FS2MNY7';
+const PAYER = 'GCBIBQVH2B3STCBIYSMTQH6DWKSB2XUGLXH7RGPIN3OXPCFCIQEICVZ6';
 const TX_HASH = 'a'.repeat(64);
 
 interface FakeResponse {
@@ -87,6 +87,11 @@ function createFakePostgres() {
         payer_email: null,
         created_at: new Date(),
         paid_at: null,
+        cancelled_at: null,
+        settled_at: null,
+        settlement_context: null,
+        prior_status: null,
+        late_payment_warning_code: null,
         metadata: null,
       };
       rows.push(row);
@@ -143,12 +148,18 @@ function createFakePostgres() {
       }
       const row = rows.find(
         candidate => candidate.id === params[0] &&
-          candidate.status === 'PENDING' &&
-          new Date(candidate.expires_at).getTime() > Date.now()
+          (
+            (candidate.status === 'PENDING' && new Date(candidate.expires_at).getTime() > Date.now()) ||
+            (candidate.status === 'CANCELLED' && candidate.cancelled_at && Number.isFinite(settledAt.getTime()))
+          )
       );
       if (!row) {
         return { rows: [], rowCount: 0 };
       }
+      const priorStatus = row.status;
+      const afterCancel =
+        priorStatus === 'CANCELLED' &&
+        settledAt.getTime() >= new Date(row.cancelled_at).getTime();
       Object.assign(row, {
         status: 'PAID',
         payment_tx_hash: params[1],
@@ -156,18 +167,26 @@ function createFakePostgres() {
         payer_name: params[3],
         payer_email: params[4],
         paid_at: new Date(),
+        settled_at: settledAt,
+        settlement_context: afterCancel ? 'AFTER_CANCEL' : 'ON_TIME',
+        prior_status: priorStatus === 'CANCELLED' ? 'CANCELLED' : null,
+        late_payment_warning_code: afterCancel ? 'PAYMENT_RECEIVED_AFTER_CANCEL' : null,
       });
       return { rows: [clone(row)], rowCount: 1 };
     }
 
     if (sql.startsWith("UPDATE invoices SET status = 'CANCELLED'")) {
+      const sellerPublicKey = params[1] ?? null;
       const row = rows.find(
-        candidate => candidate.id === params[0] && candidate.status === 'PENDING'
+        candidate => candidate.id === params[0] &&
+          candidate.status === 'PENDING' &&
+          (!sellerPublicKey || candidate.seller_public_key === sellerPublicKey)
       );
       if (!row) {
         return { rows: [], rowCount: 0 };
       }
       row.status = 'CANCELLED';
+      row.cancelled_at = new Date();
       return { rows: [clone(row)], rowCount: 1 };
     }
 
@@ -213,7 +232,7 @@ function paymentTransaction(overrides: {
   assetCode?: string;
 }) {
   return {
-    transaction: { memo: overrides.memo },
+    transaction: { memo: overrides.memo, memo_type: 'text' },
     operations: [
       {
         type: 'payment',
@@ -311,7 +330,7 @@ function runSharedBackendSuite(name: string, createBackend: () => BackendUnderTe
       assert.equal(got.body.data.customerEmail, customerEmail);
 
       transaction = {
-        transaction: { memo: created.memo },
+        transaction: { memo: created.memo, memo_type: 'text' },
         operations: [
           {
             type: 'payment',
@@ -371,6 +390,16 @@ function runSharedBackendSuite(name: string, createBackend: () => BackendUnderTe
       assert.match(res.body.data.stellarQrCode, /^data:image\/png;base64,/);
       assert.equal(res.body.data.statusPollingIntervalMs, 3000);
       assert.equal(res.body.data.paymentAvailable, true);
+    });
+
+    it('normalizes lowercase assetCode to uppercase on creation', async () => {
+      const res = await call(
+        handlers().createInvoice,
+        createReq({ body: invoiceBody({ assetCode: 'xlm' }) })
+      );
+
+      assert.equal(res.statusCode, 201);
+      assert.equal(res.body.data.invoice.assetCode, 'XLM');
     });
 
     it('accepts seller-selected expiry only within the 1-30 day contract', async () => {
@@ -470,6 +499,7 @@ function runSharedBackendSuite(name: string, createBackend: () => BackendUnderTe
       );
 
       assert.equal(res.statusCode, 400);
+      assert.equal(res.body.code, 'MISSING_TX_HASH');
       assert.equal(res.body.error, 'Transaction hash is required');
     });
 
@@ -487,6 +517,7 @@ function runSharedBackendSuite(name: string, createBackend: () => BackendUnderTe
       );
 
       assert.equal(res.statusCode, 400);
+      assert.equal(res.body.code, 'MEMO_MISMATCH');
       assert.equal(res.body.error, 'Memo mismatch');
     });
 
@@ -504,6 +535,7 @@ function runSharedBackendSuite(name: string, createBackend: () => BackendUnderTe
       );
 
       assert.equal(res.statusCode, 400);
+      assert.equal(res.body.code, 'DESTINATION_MISMATCH');
       assert.equal(res.body.error, 'Payment destination mismatch');
     });
 
@@ -521,6 +553,7 @@ function runSharedBackendSuite(name: string, createBackend: () => BackendUnderTe
       );
 
       assert.equal(res.statusCode, 400);
+      assert.equal(res.body.code, 'AMOUNT_MISMATCH');
       assert.equal(res.body.error, 'Amount mismatch');
     });
 
@@ -537,6 +570,7 @@ function runSharedBackendSuite(name: string, createBackend: () => BackendUnderTe
       const res = await call(handlers().verifyPayment, req);
 
       assert.equal(res.statusCode, 400);
+      assert.equal(res.body.code, 'INVOICE_ALREADY_PAID');
       assert.equal(res.body.error, 'Invoice has already been paid');
     });
 
@@ -682,17 +716,51 @@ function runSharedBackendSuite(name: string, createBackend: () => BackendUnderTe
 
       const cancelled = await call(
         handlers().cancelInvoice,
-        createReq({ params: { id: invoice.id } })
+        createReq({ params: { id: invoice.id }, body: { sellerPublicKey: SELLER_A } })
       );
       assert.equal(cancelled.statusCode, 200);
       assert.equal(cancelled.body.data.status, 'CANCELLED');
 
       const again = await call(
         handlers().cancelInvoice,
-        createReq({ params: { id: invoice.id } })
+        createReq({ params: { id: invoice.id }, body: { sellerPublicKey: SELLER_A } })
       );
       assert.equal(again.statusCode, 400);
       assert.equal(again.body.success, false);
+    });
+
+    it('cancels a pending invoice when sellerPublicKey matches', async () => {
+      const invoice = await createInvoice();
+
+      const cancelled = await call(
+        handlers().cancelInvoice,
+        createReq({ params: { id: invoice.id }, body: { sellerPublicKey: SELLER_A } })
+      );
+      assert.equal(cancelled.statusCode, 200);
+      assert.equal(cancelled.body.data.status, 'CANCELLED');
+    });
+
+    it('rejects cancellation when sellerPublicKey does not match (403)', async () => {
+      const invoice = await createInvoice();
+
+      const res = await call(
+        handlers().cancelInvoice,
+        createReq({ params: { id: invoice.id }, body: { sellerPublicKey: SELLER_B } })
+      );
+      assert.equal(res.statusCode, 403);
+      assert.equal(res.body.success, false);
+      assert.match(res.body.error, /unauthorized/i);
+    });
+
+    it('rejects invalid sellerPublicKey format on cancel (400)', async () => {
+      const invoice = await createInvoice();
+
+      const res = await call(
+        handlers().cancelInvoice,
+        createReq({ params: { id: invoice.id }, body: { sellerPublicKey: 'not-a-valid-stellar-key' } })
+      );
+      assert.equal(res.statusCode, 400);
+      assert.equal(res.body.success, false);
     });
 
     it('reports wallet-scoped stats', async () => {
@@ -859,11 +927,13 @@ describe('shared invoice router', () => {
   it('exposes the same routes for both backends', () => {
     const expected = [
       'POST /invoices',
-      // stats must stay ahead of /invoices/:id or the dynamic route shadows it
+      // static routes must stay ahead of /invoices/:id or the dynamic route shadows them
+      'GET /invoices/lifecycle',
       'GET /invoices/stats',
       'GET /invoices',
       'GET /invoices/:id',
       'GET /invoices/:id/payment-info',
+      'GET /invoices/:id/audit',
       'POST /invoices/:id/cancel',
       'POST /invoices/:id/verify',
       'POST /invoices/:id/simulate-payment',

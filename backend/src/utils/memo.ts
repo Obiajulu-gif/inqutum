@@ -1,4 +1,7 @@
 import { nanoid } from 'nanoid';
+import { hasInvoiceMemoPrefix } from './memo-prefix-check';
+
+export { hasInvoiceMemoPrefix } from './memo-prefix-check';
 
 export const STELLAR_MEMO_MAX_BYTES = 28;
 

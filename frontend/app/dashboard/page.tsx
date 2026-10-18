@@ -1,14 +1,17 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { invoiceApi } from '@/lib/api';
+import { invoiceApi, describeApiError } from '@/lib/api';
 import InvoiceCard from '@/components/InvoiceCard';
 import WalletConnect from '@/components/WalletConnect';
 import UserProfile from '@/components/UserProfile';
+import FreighterInstallPrompt from '@/components/FreighterInstallPrompt';
 import AssetLogo from '@/components/AssetLogo';
 import { useWalletStore } from '@/lib/store';
+import { EXPECTED_WALLET_NETWORK } from '@/lib/stellar';
+import { walletGate } from '@/lib/freighter-availability';
 import Link from 'next/link';
-import { Loader2, Plus, TrendingUp, DollarSign, FileText, Download } from 'lucide-react';
+import { Loader2, Plus, TrendingUp, DollarSign, FileText, Download, AlertTriangle } from 'lucide-react';
 import { toast } from 'sonner';
 import { downloadInvoiceCSV } from '@/lib/export';
 import {
@@ -17,12 +20,20 @@ import {
   hasAnyInvoices as hasAnyInvoicesIn,
   revenueEntries,
   searchInvoices,
+  sortInvoices,
+  DashboardSortBy,
 } from '@/lib/dashboard-history';
 import ApiErrorState from '@/components/ApiErrorState';
+// Shared resolver so the dashboard banner and invoice cards map stable
+// verification codes to the same canonical message as the other pages.
 import { apiErrorMessage } from '@/lib/api';
+import { dashboardEmptyMessage } from '@/lib/dashboard-empty-copy';
+import { DASHBOARD_RESULTS_ID, MAIN_CONTENT_ID, describeAmount, statusText } from '@/lib/a11y';
+import { NETWORK_DISPLAY_NAME } from '@/lib/stellar';
 
 export default function DashboardPage() {
-  const { publicKey, connected } = useWalletStore();
+  const { publicKey, connected, isWrongNetwork, network, freighterAvailable } = useWalletStore();
+  const gate = walletGate({ freighterAvailable, connected, publicKey, network }, EXPECTED_WALLET_NETWORK);
   // Loaded data is tagged with the wallet it belongs to, so a response for a
   // previous seller can never be rendered under the current one.
   const [loaded, setLoaded] = useState<{
@@ -39,6 +50,7 @@ export default function DashboardPage() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<string>('all');
+  const [sortBy, setSortBy] = useState<DashboardSortBy>('newest');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
@@ -46,10 +58,11 @@ export default function DashboardPage() {
 
   const { invoices, stats } = dashboardDataFor(
     loaded,
-    connected ? publicKey : null,
+    gate.ready ? publicKey : null,
     lifecycleNow
   );
   const filteredInvoices = searchInvoices(invoices, searchQuery);
+  const sortedInvoices = sortInvoices(filteredInvoices, sortBy);
   const hasAnyInvoices = hasAnyInvoicesIn(stats);
   const revenueByAsset = revenueEntries(stats);
 
@@ -101,7 +114,27 @@ export default function DashboardPage() {
     return () => {
       active = false;
     };
-  }, [filter, connected, publicKey, reloadKey]);
+  }, [filter, gate.ready, publicKey, reloadKey]);
+
+  const handleInvoiceCancelled = (cancelledId: string) => {
+    setLoaded((prev) => {
+      if (!prev.invoices) return prev;
+      const updatedInvoices = prev.invoices.map((inv) =>
+        inv.id === cancelledId ? { ...inv, status: 'CANCELLED' } : inv
+      );
+      return {
+        ...prev,
+        invoices: updatedInvoices,
+        stats: prev.stats
+          ? {
+              ...prev.stats,
+              pending_invoices: Math.max(0, Number(prev.stats.pending_invoices || 0) - 1),
+            }
+          : prev.stats,
+      };
+    });
+    setReloadKey((k) => k + 1);
+  };
 
   const loadMore = async () => {
     const cursor = loaded.nextCursor;
@@ -133,7 +166,7 @@ export default function DashboardPage() {
   };
 
   const handleExportCSV = () => {
-    const paidInvoices = exportableInvoices(filteredInvoices);
+    const paidInvoices = exportableInvoices(sortedInvoices);
     if (paidInvoices.length === 0) {
       toast.error('No paid invoices to export');
       return;
@@ -141,6 +174,26 @@ export default function DashboardPage() {
     downloadInvoiceCSV(paidInvoices as any);
     toast.success(`Exported ${paidInvoices.length} paid invoices to CSV`);
   };
+
+  const paidCount = sortedInvoices.filter((inv) => inv.status === 'PAID').length;
+  const canExport = paidCount > 0;
+
+  /*
+   * One sentence describing the current result set, read by the live region
+   * below (issue #289). Filtering and searching both replace the grid without
+   * any page navigation, so without this a screen-reader user pressing
+   * "Pending" gets no feedback that anything happened at all.
+   */
+  const resultsAnnouncement = (() => {
+    if (loadError) return `Could not load your invoices. ${loadError}`;
+    if (loading) return 'Loading your invoices.';
+    const scope = filter === 'all' ? '' : ` ${statusText(filter).label.toLowerCase()}`;
+    const suffix = searchQuery ? ` matching “${searchQuery}”` : '';
+    if (sortedInvoices.length === 0) return `No${scope} invoices${suffix}.`;
+    return `${sortedInvoices.length}${scope} invoice${
+      sortedInvoices.length === 1 ? '' : 's'
+    }${suffix}.`;
+  })();
 
   return (
     <div className="min-h-screen bg-logo-pattern relative">
@@ -151,36 +204,47 @@ export default function DashboardPage() {
           <Link href="/" className="font-display text-xl tracking-tight text-[var(--ink)] hover:opacity-80 transition-opacity">
             Quittance
           </Link>
-          <div className="flex items-center gap-3">
+          <nav className="flex items-center gap-3" aria-label="Main">
             {!connected ? (
               <WalletConnect />
             ) : (
-              <UserProfile userWallet={publicKey} onDisconnect={() => {
-                window.location.reload();
-              }} />
+              <UserProfile userWallet={publicKey} />
             )}
             <Link href="/" className="btn btn-primary flex items-center gap-2">
               <Plus className="w-5 h-5" />
               <span className="sr-only sm:not-sr-only">New Invoice</span>
             </Link>
-          </div>
+          </nav>
         </div>
       </header>
 
       <main id="main-content" className="pt-20">
         <h1 className="sr-only">Invoice dashboard</h1>
       <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8 relative z-10">
+        <h1 className="sr-only">Invoice dashboard</h1>
+        {connected && isWrongNetwork && (
+          <div
+            role="alert"
+            className="mb-6 p-4 bg-amber-50 border border-amber-300 rounded-xl flex items-center gap-3 text-sm text-amber-900"
+          >
+            <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" aria-hidden="true" />
+            <div>
+              <p className="font-semibold">Wrong Stellar Network</p>
+              <p className="mt-0.5 text-xs text-amber-800">
+                Your wallet is connected to a different network. Please switch to {NETWORK_DISPLAY_NAME} in Freighter for accurate invoice tracking.
+              </p>
+            </div>
+          </div>
+        )}
         {!connected || !publicKey ? (
           <div className="card text-center py-16 max-w-lg mx-auto">
-            <FileText className="w-16 h-16 text-gray-400 mx-auto mb-4" />
-            <h2 className="text-2xl font-bold text-gray-900 mb-2">Connect your wallet</h2>
-            <p className="text-gray-600 mb-6">
-              The dashboard shows the Quittance invoices issued by your connected
-              Freighter wallet. It never reads the rest of your wallet activity.
-            </p>
-            <div className="flex justify-center">
-              <WalletConnect />
-            </div>
+            <FileText className="w-16 h-16 text-gray-500 mx-auto mb-4" aria-hidden="true" />
+            <FreighterInstallPrompt
+              gate={gate}
+              action={<WalletConnect />}
+              className="mt-4"
+            />
+            <p className="text-gray-600 mt-6">{dashboardEmptyMessage(false)}</p>
           </div>
         ) : (
           <>
@@ -190,12 +254,12 @@ export default function DashboardPage() {
           would surface transfers unrelated to Quittance (issue #232).
         */}
         <>
-            {stats && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-6 mb-8">
+            {hasAnyInvoices && stats && (
+              <section aria-label="Invoice statistics" className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-6 mb-8">
             <div className="card">
               <div className="flex items-center gap-4">
                 <div className="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center">
-                  <FileText className="w-6 h-6 text-blue-600" />
+                  <FileText className="w-6 h-6 text-blue-700" aria-hidden="true" />
                 </div>
                 <div>
                   <p className="text-sm text-gray-600">Total Invoices</p>
@@ -209,7 +273,7 @@ export default function DashboardPage() {
             <div className="card">
               <div className="flex items-center gap-4">
                 <div className="w-12 h-12 bg-green-100 rounded-lg flex items-center justify-center">
-                  <TrendingUp className="w-6 h-6 text-green-600" />
+                  <TrendingUp className="w-6 h-6 text-green-700" aria-hidden="true" />
                 </div>
                 <div>
                   <p className="text-sm text-gray-600">Paid</p>
@@ -223,7 +287,7 @@ export default function DashboardPage() {
             <div className="card">
               <div className="flex items-center gap-4">
                 <div className="w-12 h-12 bg-yellow-100 rounded-lg flex items-center justify-center">
-                  <FileText className="w-6 h-6 text-yellow-600" />
+                  <FileText className="w-6 h-6 text-yellow-800" aria-hidden="true" />
                 </div>
                 <div>
                   <p className="text-sm text-gray-600">Pending</p>
@@ -251,50 +315,115 @@ export default function DashboardPage() {
             <div className="card">
               <div className="flex items-center gap-4">
                 <div className="w-12 h-12 bg-cyan-100 rounded-lg flex items-center justify-center">
-                  <DollarSign className="w-6 h-6 text-cyan-600" />
+                  <DollarSign className="w-6 h-6 text-cyan-700" aria-hidden="true" />
                 </div>
                 <div>
                   <p className="text-sm text-gray-600">Revenue</p>
                   {revenueByAsset.length > 0 ? (
                     <div className="space-y-1">
                       {revenueByAsset.map(([assetCode, revenue]) => (
-                        <div key={assetCode} className="flex items-center gap-2">
-                          <p className="text-2xl font-bold text-gray-900">
+                        <p key={assetCode} className="flex items-center gap-2">
+                          <span className="text-2xl font-bold text-gray-900" aria-hidden="true">
                             {Number(revenue).toFixed(2)}
-                          </p>
-                          <AssetLogo code={assetCode} size={20} />
-                        </div>
+                          </span>
+                          <AssetLogo code={assetCode} size={20} decorative />
+                          {/* The figure and the logo read as two values. */}
+                          <span className="sr-only">
+                            {describeAmount(Number(revenue).toFixed(2), assetCode)}
+                          </span>
+                        </p>
                       ))}
                     </div>
                   ) : (
-                    <p className="text-2xl font-bold text-gray-900">0.00</p>
+                    <p className="text-2xl font-bold text-gray-900">0.00 <span className="text-sm font-normal text-gray-500">XLM</span></p>
                   )}
                 </div>
               </div>
             </div>
-          </div>
+          </section>
             )}
 
+            {hasAnyInvoices && (
             <div className="flex gap-3 mb-4">
               <div className="card flex-1 mb-0">
+                <label htmlFor="invoice-search" className="sr-only">
+                  Search invoices
+                </label>
                 <input
                   type="search"
                   aria-label="Search invoices"
                   placeholder="Search invoices..."
                   className="input w-full"
                   value={searchQuery}
+                  aria-describedby={DASHBOARD_RESULTS_ID}
                   onChange={(e) => setSearchQuery(e.target.value)}
                 />
               </div>
+              {/*
+                aria-disabled rather than disabled, so the button keeps its tab
+                stop and the reason for it being unavailable is announced.
+              */}
               <button
-                onClick={handleExportCSV}
+                onClick={canExport ? handleExportCSV : undefined}
                 className="btn btn-primary flex items-center gap-2 whitespace-nowrap"
-                disabled={filteredInvoices.filter(inv => inv.status === 'PAID').length === 0}
-                title="Export paid invoices only"
+                aria-disabled={!canExport}
+                aria-describedby={canExport ? undefined : 'export-csv-reason'}
+                aria-label="Export paid invoices to CSV"
               >
                 <Download className="w-5 h-5" />
                 <span className="sr-only sm:not-sr-only">Export CSV</span>
               </button>
+              {!canExport && (
+                <span id="export-csv-reason" className="sr-only">
+                  Unavailable: there are no paid invoices in the current view.
+                </span>
+              )}
+            </div>
+            )}
+
+            {/*
+              Toggle buttons in a named group. aria-pressed carries the selected
+              state, which was previously only a background colour.
+            */}
+            <div className="bg-white rounded-lg border border-gray-200 mb-6 p-2 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+              <div
+                role="group"
+                aria-label="Filter invoices by status"
+                className="flex gap-2 flex-wrap"
+              >
+                {['all', 'pending', 'paid', 'expired', 'cancelled'].map((status) => (
+                  <button
+                    key={status}
+                    onClick={() => setFilter(status)}
+                    aria-pressed={filter === status}
+                    className={`px-4 py-2 rounded-lg font-semibold transition-colors ${
+                      filter === status
+                        ? 'bg-cyan-700 text-white'
+                        : 'text-gray-600 hover:bg-gray-100'
+                    }`}
+                  >
+                    {status.charAt(0).toUpperCase() + status.slice(1)}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-2 px-2">
+                <label htmlFor="dashboard-sort" className="text-sm font-medium text-gray-700 whitespace-nowrap">
+                  Sort:
+                </label>
+                <select
+                  id="dashboard-sort"
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value as DashboardSortBy)}
+                  className="input text-sm py-1.5 px-3 cursor-pointer"
+                  aria-label="Sort invoices"
+                >
+                  <option value="newest">Newest first</option>
+                  <option value="oldest">Oldest first</option>
+                  <option value="amount-desc">Amount: High to Low</option>
+                  <option value="amount-asc">Amount: Low to High</option>
+                  <option value="status">Status</option>
+                </select>
+              </div>
             </div>
 
             <div role="group" aria-label="Filter by status" className="bg-white rounded-lg border border-gray-200 mb-6 p-2 flex gap-2 flex-wrap">
@@ -322,11 +451,11 @@ export default function DashboardPage() {
               />
             ) : loading ? (
               <div className="flex items-center justify-center py-12">
-                <Loader2 className="w-12 h-12 animate-spin text-cyan-500" />
+                <Loader2 className="w-12 h-12 animate-spin text-cyan-700" aria-hidden="true" />
               </div>
-            ) : filteredInvoices.length === 0 ? (
+            ) : sortedInvoices.length === 0 ? (
               <div className="card text-center py-12">
-                <FileText className="w-16 h-16 text-gray-400 mx-auto mb-4" />
+                <FileText className="w-16 h-16 text-gray-500 mx-auto mb-4" aria-hidden="true" />
                 <h3 className="text-xl font-semibold text-gray-700 mb-2">
                   {searchQuery
                     ? 'No Matching Invoices'
@@ -339,7 +468,7 @@ export default function DashboardPage() {
                     ? 'Try a different search term or clear your search.'
                     : hasAnyInvoices
                       ? 'Choose another status to see your other invoices.'
-                      : 'Create your first invoice and start accepting Stellar payments. Only Quittance invoices appear here.'}
+                      : dashboardEmptyMessage(true)}
                 </p>
                 {searchQuery ? (
                   <button
@@ -359,21 +488,34 @@ export default function DashboardPage() {
                   </button>
                 ) : (
                   <Link href="/" className="btn btn-primary inline-flex items-center gap-2">
-                    <Plus className="w-5 h-5" />
+                    <Plus className="w-5 h-5" aria-hidden="true" />
                     Create Invoice
                   </Link>
                 )}
               </div>
             ) : (
-              <>
-                {searchQuery && (
-                  <div className="mb-4 text-sm text-gray-600">
-                    Found {filteredInvoices.length} invoice{filteredInvoices.length !== 1 ? 's' : ''}
-                  </div>
-                )}
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {filteredInvoices.map((invoice) => (
-                    <InvoiceCard key={invoice.id} invoice={invoice as any} />
+              /*
+                The count that used to sit here is now in the live region above,
+                which covers filtering too and not only searching.
+              */
+              <section aria-labelledby="invoice-list-heading">
+                {/*
+                  The cards below are h3s. Without this h2 the outline jumped
+                  from the page's h1 straight to h3, which axe reports as
+                  heading-order and which breaks heading-based navigation.
+                */}
+                <h2 id="invoice-list-heading" className="sr-only">
+                  Invoices
+                </h2>
+                <ul className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 list-none p-0">
+                  {sortedInvoices.map((invoice) => (
+                    <li key={invoice.id}>
+                      <InvoiceCard
+                        invoice={invoice as any}
+                        userWallet={publicKey}
+                        onCancel={handleInvoiceCancelled}
+                      />
+                    </li>
                   ))}
                 </div>
                 {loaded.nextCursor && (

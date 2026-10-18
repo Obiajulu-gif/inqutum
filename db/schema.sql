@@ -11,7 +11,8 @@
 --   memo, description
 --   customer_name, customer_email
 --   status, payment_tx_hash
---   payer_public_key, payer_name, payer_email, paid_at
+--   payer_public_key, payer_name, payer_email, paid_at, cancelled_at
+--   settled_at, settlement_context, prior_status, late_payment_warning_code
 --   created_at, expires_at             (expires_at NOT NULL, default 7d)
 --   metadata (JSONB)
 
@@ -35,6 +36,11 @@ CREATE TABLE IF NOT EXISTS invoices (
   payer_email VARCHAR(255),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   paid_at TIMESTAMPTZ,
+  cancelled_at TIMESTAMPTZ,
+  settled_at TIMESTAMPTZ,
+  settlement_context VARCHAR(20) CHECK (settlement_context IN ('ON_TIME', 'AFTER_EXPIRY', 'AFTER_CANCEL')),
+  prior_status VARCHAR(20) CHECK (prior_status IN ('PENDING', 'PAID', 'EXPIRED', 'CANCELLED')),
+  late_payment_warning_code VARCHAR(50) CHECK (late_payment_warning_code IN ('PAYMENT_RECEIVED_AFTER_EXPIRY', 'PAYMENT_RECEIVED_AFTER_CANCEL')),
   expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '7 days',
   metadata JSONB
 );
@@ -159,13 +165,60 @@ WHERE expires_at IS NULL;
 ALTER TABLE invoices ALTER COLUMN expires_at SET DEFAULT NOW() + INTERVAL '7 days';
 ALTER TABLE invoices ALTER COLUMN expires_at SET NOT NULL;
 
+-- Converge databases created before deterministic cancel/payment settlement.
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS settlement_context VARCHAR(20);
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS prior_status VARCHAR(20);
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS late_payment_warning_code VARCHAR(50);
+
+ALTER TABLE invoices DROP CONSTRAINT IF EXISTS invoices_settlement_context_check;
+ALTER TABLE invoices ADD CONSTRAINT invoices_settlement_context_check
+  CHECK (settlement_context IS NULL OR settlement_context IN ('ON_TIME', 'AFTER_EXPIRY', 'AFTER_CANCEL'));
+
+ALTER TABLE invoices DROP CONSTRAINT IF EXISTS invoices_prior_status_check;
+ALTER TABLE invoices ADD CONSTRAINT invoices_prior_status_check
+  CHECK (prior_status IS NULL OR prior_status IN ('PENDING', 'PAID', 'EXPIRED', 'CANCELLED'));
+
+ALTER TABLE invoices DROP CONSTRAINT IF EXISTS invoices_late_payment_warning_code_check;
+ALTER TABLE invoices ADD CONSTRAINT invoices_late_payment_warning_code_check
+  CHECK (
+    late_payment_warning_code IS NULL OR
+    late_payment_warning_code IN ('PAYMENT_RECEIVED_AFTER_EXPIRY', 'PAYMENT_RECEIVED_AFTER_CANCEL')
+  );
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_invoices_seller ON invoices(seller_public_key);
 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
+CREATE INDEX IF NOT EXISTS idx_invoices_asset_code ON invoices(asset_code);
 CREATE INDEX IF NOT EXISTS idx_invoices_memo ON invoices(memo);
+-- Bulk import idempotency (issue #53). Import rows may carry an externalId
+-- supplied by the caller own system; it is the key a re-import matches on so
+-- repeating a file does not create a second invoice. Nullable, and unique only
+-- where present, so ordinary invoices created through the API are unaffected.
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS external_id VARCHAR(255);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_external_id ON invoices(external_id) WHERE external_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_invoices_created_at ON invoices(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_invoices_seller_created_at ON invoices(seller_public_key, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_invoices_pending_expiry ON invoices(expires_at) WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency_keys(expires_at);
+-- One Stellar transaction settles at most one invoice (issue #14). The database,
+-- not just the in-process claim index, refuses a second invoice carrying the same
+-- payment_tx_hash, even across instances and restarts. Partial: pending, expired
+-- and cancelled invoices have no hash and never collide. If an older database
+-- already holds duplicates, stop with a readable message instead of a bare index
+-- error; those rows are double-settlements and must be resolved by hand.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM invoices WHERE payment_tx_hash IS NOT NULL
+    GROUP BY payment_tx_hash HAVING COUNT(*) > 1
+  ) THEN
+    RAISE EXCEPTION 'invoices.payment_tx_hash has duplicates; resolve them before applying idx_invoices_payment_tx_hash_unique';
+  END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_payment_tx_hash_unique
+  ON invoices(payment_tx_hash) WHERE payment_tx_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_transactions_tx_hash ON transactions(tx_hash);
 CREATE INDEX IF NOT EXISTS idx_transactions_invoice_id ON transactions(invoice_id);
 
@@ -182,3 +235,29 @@ SELECT
   asset_code
 FROM invoices
 GROUP BY seller_public_key, asset_code;
+
+-- Email Deliveries Table (Phase E queue & anti-spam)
+CREATE TABLE IF NOT EXISTS email_deliveries (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  invoice_id UUID REFERENCES invoices(id) ON DELETE CASCADE,
+  recipient_email VARCHAR(255) NOT NULL,
+  sender_wallet VARCHAR(56) NOT NULL,
+  email_type VARCHAR(50) NOT NULL,
+  subject VARCHAR(255) NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'SENDING', 'SENT', 'FAILED', 'PERMANENTLY_FAILED', 'PAUSED')),
+  attempts INT NOT NULL DEFAULT 0,
+  max_attempts INT NOT NULL DEFAULT 5,
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_attempt_at TIMESTAMPTZ,
+  last_error TEXT,
+  is_retryable BOOLEAN NOT NULL DEFAULT TRUE,
+  payload JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  sent_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_deliveries_invoice ON email_deliveries(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_email_deliveries_sender ON email_deliveries(sender_wallet);
+CREATE INDEX IF NOT EXISTS idx_email_deliveries_pending ON email_deliveries(status, next_attempt_at) WHERE status = 'PENDING';
+

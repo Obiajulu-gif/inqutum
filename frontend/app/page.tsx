@@ -1,28 +1,58 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { motion } from 'motion/react';
+// InvoiceForm surfaces submit failures through apiErrorMessage, which maps any
+// stable verification code to one canonical message across the whole app.
 import InvoiceForm from '@/components/InvoiceForm';
 import QRCodeDisplay from '@/components/QRCodeDisplay';
 import WalletConnect from '@/components/WalletConnect';
 import UserProfile from '@/components/UserProfile';
+import FreighterInstallPrompt from '@/components/FreighterInstallPrompt';
 import AssetLogo from '@/components/AssetLogo';
 import { useWalletStore } from '@/lib/store';
-import { Mail } from 'lucide-react';
+import { EXPECTED_WALLET_NETWORK, NETWORK_DISPLAY_NAME } from '@/lib/stellar';
+import { walletGate } from '@/lib/freighter-availability';
+import { Mail, AlertTriangle } from 'lucide-react';
 import { toast } from 'sonner';
 import { shareInvoiceByEmail } from '@/lib/export';
 import { renderLandingBullets } from '@/lib/landing-feature-bullets';
+import { CREATED_INVOICE_ID, MAIN_CONTENT_ID, describeAmount } from '@/lib/a11y';
 
 export default function HomePage() {
   const [createdInvoice, setCreatedInvoice] = useState<any>(null);
-  const { publicKey, connected } = useWalletStore();
+  const { publicKey, connected, network, freighterAvailable, isWrongNetwork } = useWalletStore();
+  const resultRef = useRef<HTMLDivElement>(null);
+  const gate = walletGate(
+    { freighterAvailable, connected, publicKey, network },
+    EXPECTED_WALLET_NETWORK
+  );
 
   const handleInvoiceCreated = (result: any) => setCreatedInvoice(result);
   const handleWalletDisconnected = () => setCreatedInvoice(null);
 
+  /*
+   * Creating an invoice is an async result that appears in a panel beside the
+   * form (issue #289). Submitting leaves focus on the submit button, so the QR
+   * code and the share link — the entire point of the action — were announced
+   * to nobody and were several tab stops away. Moving focus to the panel puts
+   * the result first and the share controls immediately after it.
+   */
+  useEffect(() => {
+    if (!createdInvoice) return;
+    resultRef.current?.focus();
+  }, [createdInvoice]);
+
+  useEffect(() => {
+    if (gate.ready) return;
+    setCreatedInvoice(null);
+  }, [gate.ready]);
+
   const scrollToCreate = () => {
     document.getElementById('create')?.scrollIntoView({ behavior: 'smooth' });
+    // Scrolling alone moves nothing for a keyboard user; focus has to follow.
+    document.getElementById('invoice-amount')?.focus();
   };
 
   return (
@@ -32,7 +62,7 @@ export default function HomePage() {
           <Link href="/" className="font-display text-2xl tracking-tight text-[var(--ink)]">
             Quittance
           </Link>
-          <nav className="flex items-center gap-3 sm:gap-5">
+          <nav className="flex items-center gap-3 sm:gap-5" aria-label="Main">
             <Link
               href="/dashboard"
               className="hidden sm:inline text-sm text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
@@ -51,7 +81,7 @@ export default function HomePage() {
       <main id="main-content">
 
       {/* Hero — one composition */}
-      <section className="relative min-h-[100svh] flex flex-col justify-center hero-atmosphere overflow-hidden">
+      <section className="relative min-h-[100svh] flex flex-col justify-center hero-atmosphere overflow-hidden" aria-labelledby="hero-heading">
         <div className="hero-grain" aria-hidden />
         <div className="relative z-10 max-w-6xl mx-auto px-5 sm:px-8 pt-24 pb-20 w-full">
           <motion.div
@@ -70,7 +100,7 @@ export default function HomePage() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.6, delay: 0.15, ease: [0.22, 1, 0.36, 1] }}
           >
-            Invoice on Stellar. Get paid. Keep the proof.
+            Invoice on Stellar in XLM or USDC. Get paid. Keep the proof.
           </motion.p>
 
           <motion.div
@@ -79,7 +109,7 @@ export default function HomePage() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.6, delay: 0.28, ease: [0.22, 1, 0.36, 1] }}
           >
-            {connected ? (
+            {gate.ready ? (
               <button type="button" onClick={scrollToCreate} className="btn btn-primary px-7 py-3">
                 Create invoice
               </button>
@@ -94,9 +124,10 @@ export default function HomePage() {
       </section>
 
       {/* How it works — editorial, no cards */}
-      <section className="border-t border-[var(--line)] bg-white">
+      <section className="border-t border-[var(--line)] bg-white" aria-labelledby="how-it-works-heading">
         <div className="max-w-6xl mx-auto px-5 sm:px-8 py-20 sm:py-28">
           <motion.h2
+            id="how-it-works-heading"
             className="font-display text-3xl sm:text-4xl text-[var(--ink)] mb-14"
             initial={{ opacity: 0, y: 10 }}
             whileInView={{ opacity: 1, y: 0 }}
@@ -127,10 +158,14 @@ export default function HomePage() {
       </section>
 
       {/* Create — interaction surface */}
-      <section id="create" className="border-t border-[var(--line)] bg-[var(--paper)]">
+      <section
+        id="create"
+        className="border-t border-[var(--line)] bg-[var(--paper)]"
+        aria-labelledby="create-heading"
+      >
         <div className="max-w-6xl mx-auto px-5 sm:px-8 py-20 sm:py-28">
           <div className="mb-12 max-w-xl">
-            <h2 className="font-display text-3xl sm:text-4xl text-[var(--ink)]">Create an invoice</h2>
+            <h2 id="create-heading" className="font-display text-3xl sm:text-4xl text-[var(--ink)]">Create an invoice</h2>
             <p className="mt-3 text-[var(--muted)]">
               Payments go to your connected wallet. Client email is optional — only for sending the link.
             </p>
@@ -142,15 +177,18 @@ export default function HomePage() {
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-10 lg:gap-16 items-start">
             <div className="card">
-              {!connected ? (
+              {!gate.ready ? (
                 <div className="py-8 text-center">
-                  <p className="font-display text-2xl text-[var(--ink)] mb-3">Connect Freighter</p>
-                  <p className="text-[var(--muted)] text-sm mb-8 max-w-sm mx-auto">
-                    Your wallet is your identity. No Google account required.
+                  <FreighterInstallPrompt gate={gate} action={<WalletConnect />} />
+                </div>
+              ) : isWrongNetwork ? (
+                <div className="py-8 text-center">
+                  <AlertTriangle className="w-10 h-10 text-amber-600 mx-auto mb-3" aria-hidden="true" />
+                  <h3 className="font-semibold text-lg text-amber-900 mb-2">Wrong Stellar Network</h3>
+                  <p className="text-sm text-amber-800 max-w-md mx-auto">
+                    Your Freighter wallet is connected to a different network. Please switch to {NETWORK_DISPLAY_NAME} in Freighter, then reconnect to create invoices.
                   </p>
-                  <div className="flex justify-center">
-                    <WalletConnect />
-                  </div>
+                  <WalletConnect />
                 </div>
               ) : (
                 <>
@@ -163,12 +201,27 @@ export default function HomePage() {
 
             <div>
               {createdInvoice ? (
-                <div className="card space-y-5">
+                /*
+                 * The async result of creating an invoice: a polite live region
+                 * that also receives focus, so the outcome is both announced
+                 * and reachable without hunting for it.
+                 */
+                <div
+                  id={CREATED_INVOICE_ID}
+                  ref={resultRef}
+                  tabIndex={-1}
+                  role="status"
+                  aria-live="polite"
+                  aria-labelledby="created-invoice-heading"
+                  className="card space-y-5"
+                >
                   <div>
                     <p className="text-xs tracking-wide text-[var(--teal)] font-medium uppercase">
                       Ready to share
                     </p>
-                    <h3 className="font-display text-2xl mt-1">Invoice created</h3>
+                    <h3 id="created-invoice-heading" className="font-display text-2xl mt-1">
+                      Invoice created
+                    </h3>
                   </div>
 
                   <div className="flex justify-center py-4 bg-[var(--paper)] rounded-md border border-[var(--line)]">
@@ -176,18 +229,39 @@ export default function HomePage() {
                       value={createdInvoice.paymentUrl}
                       title="Scan to pay"
                       size={180}
+                      description={`a payment link for ${describeAmount(
+                        createdInvoice.invoice.amount,
+                        createdInvoice.invoice.assetCode
+                      )}`}
                     />
                   </div>
 
-                  <div className="flex items-baseline gap-3">
-                    <AssetLogo code={createdInvoice.invoice.assetCode} size={28} showName={false} />
-                    <span className="font-display text-4xl">
+                  {/*
+                    The figure and the asset code are separate elements, which
+                    read as two unrelated values. A screen reader equivalent
+                    replaces both — ARIA prohibits naming a <p> directly.
+                  */}
+                  <p className="flex items-baseline gap-3">
+                    <AssetLogo
+                      code={createdInvoice.invoice.assetCode}
+                      size={28}
+                      showName={false}
+                      decorative
+                    />
+                    <span className="font-display text-4xl" aria-hidden="true">
                       {createdInvoice.invoice.amount}
                     </span>
-                    <span className="text-[var(--teal)] font-medium">
+                    <span className="text-[var(--teal)] font-medium" aria-hidden="true">
                       {createdInvoice.invoice.assetCode}
                     </span>
-                  </div>
+                    <span className="sr-only">
+                      Amount:{' '}
+                      {describeAmount(
+                        createdInvoice.invoice.amount,
+                        createdInvoice.invoice.assetCode
+                      )}
+                    </span>
+                  </p>
 
                   {createdInvoice.invoice.description && (
                     <p className="text-sm text-[var(--muted)]">{createdInvoice.invoice.description}</p>
@@ -210,7 +284,12 @@ export default function HomePage() {
                     </div>
                   )}
 
-                  <p className="font-mono text-[11px] break-all text-[var(--muted)] bg-[var(--ink)] text-white/90 p-3 rounded-md">
+                  {/*
+                    text-white/90 on --ink is legible, but the --muted colour it
+                    also carried would have won had the opacity ever changed.
+                  */}
+                  <p className="font-mono text-[11px] break-all bg-[var(--ink)] text-white p-3 rounded-md">
+                    <span className="sr-only">Payment link: </span>
                     {createdInvoice.paymentUrl}
                   </p>
 
@@ -233,8 +312,9 @@ export default function HomePage() {
                           toast.success('Opening email');
                         }}
                         className="btn btn-secondary"
+                        aria-label={`Email this invoice to ${createdInvoice.invoice.customerEmail}`}
                       >
-                        <Mail className="w-4 h-4" />
+                        <Mail className="w-4 h-4" aria-hidden="true" />
                         Send
                       </button>
                     )}
@@ -242,6 +322,7 @@ export default function HomePage() {
                       type="button"
                       onClick={() => setCreatedInvoice(null)}
                       className="btn btn-outline"
+                      aria-label="Dismiss this invoice and create a new one"
                     >
                       New
                     </button>
@@ -259,6 +340,7 @@ export default function HomePage() {
           </div>
         </div>
       </section>
+      </main>
 
       </main>
 
@@ -270,17 +352,19 @@ export default function HomePage() {
               Stellar invoices with downloadable payment proof.
             </p>
           </div>
-          <div className="flex flex-wrap gap-6 text-sm text-[var(--muted)]">
+          <nav className="flex flex-wrap gap-6 text-sm text-[var(--muted)]" aria-label="Footer">
             <Link href="/dashboard" className="hover:text-[var(--ink)]">
               Dashboard
             </Link>
             <a href="https://www.stellar.org" target="_blank" rel="noopener noreferrer" className="hover:text-[var(--ink)]">
               Stellar
+              <span className="sr-only"> (opens in a new tab)</span>
             </a>
             <a href="https://stellar.expert/explorer/testnet" target="_blank" rel="noopener noreferrer" className="hover:text-[var(--ink)]">
               Explorer
+              <span className="sr-only"> (opens in a new tab)</span>
             </a>
-          </div>
+          </nav>
         </div>
         <div className="border-t border-[var(--line)]">
           <p className="max-w-6xl mx-auto px-5 sm:px-8 py-4 text-xs text-[var(--muted)]">

@@ -1,4 +1,5 @@
 import * as StellarSdk from '@stellar/stellar-sdk';
+import * as FreighterApi from '@stellar/freighter-api';
 import {
   isConnected,
   getPublicKey,
@@ -12,8 +13,8 @@ import { detectFreighter } from './freighter-availability';
 import { explorerTransactionUrl } from './safe-content.js';
 
 // Network configuration
-const STELLAR_NETWORK = process.env.NEXT_PUBLIC_STELLAR_NETWORK || 'TESTNET';
-const HORIZON_URL =
+export const STELLAR_NETWORK = process.env.NEXT_PUBLIC_STELLAR_NETWORK || 'TESTNET';
+export const HORIZON_URL =
   process.env.NEXT_PUBLIC_HORIZON_URL ||
   (STELLAR_NETWORK === 'TESTNET'
     ? 'https://horizon-testnet.stellar.org'
@@ -24,11 +25,19 @@ export const NETWORK_PASSPHRASE =
     ? StellarSdk.Networks.TESTNET
     : StellarSdk.Networks.PUBLIC;
 
+export const NETWORK_DISPLAY_NAME = networkDisplayName(NETWORK_PASSPHRASE);
+export const EXPECTED_WALLET_NETWORK = STELLAR_NETWORK.toUpperCase();
+
 export const server = new StellarSdk.Horizon.Server(HORIZON_URL);
 
 // Malformed hashes fall back to the explorer home rather than building a link from untrusted text.
 export const getExplorerTransactionUrl = (txHash: string): string =>
   explorerTransactionUrl(STELLAR_NETWORK, txHash);
+
+export const getExplorerAccountUrl = (publicKey: string, walletNetwork = STELLAR_NETWORK): string => {
+  const network = walletNetwork === 'PUBLIC' ? 'public' : 'testnet';
+  return `https://stellar.expert/explorer/${network}/account/${encodeURIComponent(publicKey)}`;
+};
 
 const getTrustlineMessage = (assetCode: string): string =>
   `Your wallet does not have a ${assetCode} trustline on ${STELLAR_NETWORK.toLowerCase()}. Add the ${assetCode} trustline in Freighter, or ask the seller for an XLM invoice.`;
@@ -90,6 +99,174 @@ export const getUserPublicKey = async (): Promise<string | null> => {
     console.error('Error getting public key:', error);
     return null;
   }
+};
+
+export const readFreighterSession = async (): Promise<FreighterSession> => {
+  const freighterAvailable = await checkWalletConnection();
+  if (!freighterAvailable) {
+    return {
+      freighterAvailable: false,
+      connected: false,
+      publicKey: null,
+      network: null,
+      networkPassphrase: null,
+    };
+  }
+
+  const [allowed, publicKey, network] = await Promise.all([
+    isAllowed().then((value) => readResultBoolean(value, 'isAllowed')).catch(() => false),
+    getUserPublicKey(),
+    getFreighterNetwork(),
+  ]);
+
+  return {
+    freighterAvailable: true,
+    connected: allowed && Boolean(publicKey),
+    publicKey,
+    network: network?.network ?? null,
+    networkPassphrase: network?.networkPassphrase ?? null,
+  };
+};
+
+export const stopFreighterWalletWatcher = (
+  onChange: (session: FreighterSession) => void,
+  intervalMs = 1000
+): (() => void) => {
+  const WatchWalletChanges = (FreighterApi as any).WatchWalletChanges;
+  if (typeof WatchWalletChanges !== 'function') return () => {};
+
+  const watcher = new WatchWalletChanges(intervalMs);
+  watcher.watch((change: any) => {
+    onChange({
+      freighterAvailable: true,
+      connected: Boolean(change?.address || change?.publicKey),
+      publicKey: change?.address || change?.publicKey || null,
+      network: change?.network || null,
+      networkPassphrase: change?.networkPassphrase || null,
+    });
+  });
+
+  return () => watcher.stop();
+};
+
+export const assertFreighterReady = async (): Promise<FreighterSession> => {
+  const session = await readFreighterSession();
+  if (!session.freighterAvailable) throw new Error(FREIGHTER_REQUIRED_MESSAGE);
+  if (!session.connected || !session.publicKey) throw new Error(FREIGHTER_CONNECT_REQUIRED_MESSAGE);
+  if (!networkMatches(session.network, EXPECTED_WALLET_NETWORK)) {
+    throw new Error(wrongNetworkMessage(EXPECTED_WALLET_NETWORK, session.network));
+  }
+  return session;
+};
+
+/**
+ * Query current network and passphrase from Freighter
+ */
+export const getFreighterNetwork = async (): Promise<FreighterNetwork | null> => {
+  try {
+    const connected = await checkWalletConnection();
+    if (!connected) return null;
+
+    const [netResult, detailsResult] = await Promise.allSettled([
+      getNetwork(),
+      getNetworkDetails(),
+    ]);
+
+    const networkName = netResult.status === 'fulfilled' ? netResult.value : null;
+    const details = detailsResult.status === 'fulfilled' ? detailsResult.value : null;
+
+    const rawNetwork = networkName || details?.network || null;
+    let passphrase = details?.networkPassphrase || null;
+
+    if (!passphrase && rawNetwork) {
+      const upper = rawNetwork.toUpperCase();
+      if (upper === 'PUBLIC' || upper === 'MAINNET') {
+        passphrase = StellarSdk.Networks.PUBLIC;
+      } else if (upper === 'TESTNET') {
+        passphrase = StellarSdk.Networks.TESTNET;
+      }
+    }
+
+    if (!rawNetwork && !passphrase) return null;
+
+    return {
+      network: rawNetwork || (passphrase === StellarSdk.Networks.PUBLIC ? 'PUBLIC' : 'TESTNET'),
+      networkPassphrase: passphrase || (rawNetwork?.toUpperCase() === 'PUBLIC' ? StellarSdk.Networks.PUBLIC : StellarSdk.Networks.TESTNET),
+      networkUrl: details?.networkUrl,
+    };
+  } catch (error) {
+    console.error('Error getting Freighter network:', error);
+    return null;
+  }
+};
+
+/**
+ * Check if the given network or passphrase matches our expected network
+ */
+export const isWrongNetwork = (
+  currentNetworkOrPassphrase: string | null | undefined,
+  expectedNetwork: string = STELLAR_NETWORK
+): boolean => {
+  if (!currentNetworkOrPassphrase) return false;
+  const current = currentNetworkOrPassphrase.trim();
+  const expected = expectedNetwork.toUpperCase();
+  const expectedPassphrase =
+    expected === 'TESTNET' ? StellarSdk.Networks.TESTNET : StellarSdk.Networks.PUBLIC;
+
+  if (
+    current.toUpperCase() === expected ||
+    current === expectedPassphrase
+  ) {
+    return false;
+  }
+
+  // Check if current is matching known counterpart
+  if (expected === 'TESTNET' && current.toLowerCase().includes('test sdf network')) {
+    return false;
+  }
+  if (expected === 'PUBLIC' && current.toLowerCase().includes('public global stellar network')) {
+    return false;
+  }
+
+  return true;
+};
+
+/**
+ * Watch Freighter network changes on an interval
+ */
+export const watchFreighterNetwork = (
+  callback: (details: { network: string; networkPassphrase: string; isWrongNetwork: boolean } | null) => void,
+  intervalMs = 2500
+): (() => void) => {
+  let active = true;
+
+  const poll = async () => {
+    if (!active) return;
+    try {
+      const details = await getFreighterNetwork();
+      if (!active) return;
+      if (details?.network && details.networkPassphrase) {
+        const wrong = isWrongNetwork(details.networkPassphrase || details.network);
+        callback({
+          network: details.network,
+          networkPassphrase: details.networkPassphrase,
+          isWrongNetwork: wrong,
+        });
+      } else {
+        callback(null);
+      }
+    } catch {
+      if (active) callback(null);
+    }
+  };
+
+  void poll();
+  const intervalId = setInterval(poll, intervalMs);
+
+  return () => {
+    active = false;
+    clearInterval(intervalId);
+  };
 };
 
 /**
@@ -180,7 +357,8 @@ export const sendPayment = async (
   amount: string,
   memo: string,
   assetCode: string = 'XLM',
-  assetIssuer?: string
+  assetIssuer?: string,
+  isSessionCurrent?: (sourceAccount: string) => boolean
 ): Promise<string> => {
   try {
     // Live pre-flight check of connection & authorization (Issue #21)
@@ -206,18 +384,20 @@ export const sendPayment = async (
       throw error;
     }
 
+    const normalizedAssetCode = (assetCode || 'XLM').toUpperCase();
+
     // Create asset
     const asset =
-      assetCode === 'XLM'
+      normalizedAssetCode === 'XLM'
         ? StellarSdk.Asset.native()
-        : new StellarSdk.Asset(assetCode, assetIssuer!);
+        : new StellarSdk.Asset(normalizedAssetCode, assetIssuer!);
 
     if (
-      assetCode !== 'XLM' &&
+      normalizedAssetCode !== 'XLM' &&
       assetIssuer &&
-      !hasAssetTrustline(account, assetCode, assetIssuer)
+      !hasAssetTrustline(account, normalizedAssetCode, assetIssuer)
     ) {
-      throw new Error(getTrustlineMessage(assetCode));
+      throw new Error(getTrustlineMessage(normalizedAssetCode));
     }
 
     // Build transaction
@@ -240,12 +420,23 @@ export const sendPayment = async (
     const signedTxXdr = await freighterAdapter.signTransaction(transaction.toXDR(), {
       networkPassphrase: NETWORK_PASSPHRASE,
     });
+    const signedTxXdr = readResultString(signedResult, ['signedTxXdr']);
+    if (!signedTxXdr) {
+      throw new Error('Freighter did not return a signed transaction');
+    }
 
     // Parse signed transaction
     const signedTx = StellarSdk.TransactionBuilder.fromXDR(
       signedTxXdr,
       NETWORK_PASSPHRASE
     );
+
+    // Do not broadcast a transaction if Freighter changed accounts while its
+    // signing prompt was open. The source account is fixed in the signed XDR,
+    // but the user must confirm the new wallet session before any payment.
+    if (isSessionCurrent && !isSessionCurrent(userPublicKey)) {
+      throw new Error('Freighter account changed during payment');
+    }
 
     // Submit to network
     const result = await server.submitTransaction(signedTx as any);
@@ -332,12 +523,18 @@ export const isValidPublicKey = (publicKey: string): boolean => {
   }
 };
 
-export default {
+const stellarService = {
   server,
+  STELLAR_NETWORK,
+  HORIZON_URL,
   NETWORK_PASSPHRASE,
+  NETWORK_DISPLAY_NAME,
   checkWalletConnection,
   requestWalletAccess,
   getUserPublicKey,
+  getFreighterNetwork,
+  isWrongNetwork,
+  watchFreighterNetwork,
   loadAccount,
   getAccountBalance,
   sendPayment,
@@ -348,3 +545,5 @@ export default {
   isValidPublicKey,
   describeStellarNetworkError,
 };
+
+export default stellarService;

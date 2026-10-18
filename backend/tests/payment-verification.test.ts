@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   VERIFICATION_MESSAGES,
+  VERIFICATION_CODES,
+  messageForCode,
   STROOP_PRECISION,
   amountsMatch,
   checkInvoiceIsPayable,
@@ -289,6 +291,48 @@ describe('verifyHorizonPayment — rejections', () => {
     assert.equal(codeOf(verifyHorizonPayment(input({ txHash: '' }))), 'MISSING_TX_HASH');
   });
 
+  it('rejects a memo of the wrong TYPE even when its value equals the invoice memo', () => {
+    for (const memo_type of ['id', 'hash', 'return', 'none']) {
+      const result = verifyHorizonPayment(
+        input({ transaction: { memo: 'INV-2K4H9', memo_type } })
+      );
+      assert.equal(codeOf(result), 'MEMO_MISMATCH', memo_type);
+    }
+  });
+
+  it('rejects a MEMO_HASH whose base64 form equals a text invoice memo', () => {
+    const hashAsText = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
+    const result = verifyHorizonPayment(
+      input({
+        expected: expected({ memo: hashAsText }),
+        transaction: { memo: hashAsText, memo_type: 'hash' },
+      })
+    );
+    assert.equal(codeOf(result), 'MEMO_MISMATCH');
+  });
+
+  it('rejects a memo with no memo_type instead of guessing text', () => {
+    const result = verifyHorizonPayment(input({ transaction: { memo: 'INV-2K4H9' } }));
+    assert.equal(codeOf(result), 'MEMO_MISMATCH');
+  });
+
+  it('does not trim or case-fold a text memo', () => {
+    for (const memo of ['INV-2K4H9 ', ' INV-2K4H9', 'inv-2k4h9']) {
+      const result = verifyHorizonPayment(input({ transaction: { memo, memo_type: 'text' } }));
+      assert.equal(codeOf(result), 'MEMO_MISMATCH', JSON.stringify(memo));
+    }
+  });
+
+  it('accepts an invoice that requires a numeric MEMO_ID with numeric normalization', () => {
+    const result = verifyHorizonPayment(
+      input({
+        expected: expected({ memo: '5', memoType: 'id' }),
+        transaction: { memo: '05', memo_type: 'id' },
+      })
+    );
+    assert.equal(result.ok, true);
+  });
+
   it('rejects a memo mismatch', () => {
     const result = verifyHorizonPayment(
       input({ transaction: { memo: 'INV-WRONG', memo_type: 'text' } })
@@ -411,6 +455,30 @@ describe('verifyHorizonPayment — rejections', () => {
     assert.equal(codeOf(result), 'ASSET_MISMATCH');
   });
 
+  it('settles a valid USDC credit payment with matching issuer and amount', () => {
+    const result = verifyHorizonPayment(
+      input({
+        expected: expected({ assetCode: 'USDC', assetIssuer: USDC_ISSUER, amount: 50 }),
+        operations: [
+          paymentOp({
+            asset_type: 'credit_alphanum4',
+            asset_code: 'USDC',
+            asset_issuer: USDC_ISSUER,
+            amount: '50.0000000',
+          }),
+        ],
+      }),
+    );
+
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.value.from, PAYER);
+      assert.equal(result.value.amount, '50.0000000');
+      assert.equal(result.value.assetCode, 'USDC');
+      assert.equal(result.value.assetIssuer, USDC_ISSUER);
+    }
+  });
+
   it('rejects a transaction with no payment operation', () => {
     assert.equal(
       codeOf(verifyHorizonPayment(input({ operations: [{ type: 'create_account' }] }))),
@@ -442,7 +510,7 @@ describe('verifyHorizonPayment — check ordering', () => {
     // A payment wrong in several ways at once: memo is reported first, then
     // destination, then amount, then asset.
     const allWrong = input({
-      transaction: { memo: 'INV-WRONG' },
+      transaction: { memo: 'INV-WRONG', memo_type: 'text' },
       operations: [
         paymentOp({
           to: OTHER_ACCOUNT,
@@ -455,7 +523,7 @@ describe('verifyHorizonPayment — check ordering', () => {
     });
     assert.equal(codeOf(verifyHorizonPayment(allWrong)), 'MEMO_MISMATCH');
 
-    const memoFixed = { ...allWrong, transaction: { memo: 'INV-2K4H9' } };
+    const memoFixed = { ...allWrong, transaction: { memo: 'INV-2K4H9', memo_type: 'text' } };
     assert.equal(codeOf(verifyHorizonPayment(memoFixed)), 'DESTINATION_MISMATCH');
 
     const destinationFixed = {
@@ -571,5 +639,14 @@ describe('shared contract', () => {
 
     assert.deepEqual(clientVerification.VERIFICATION_MESSAGES, VERIFICATION_MESSAGES);
     assert.ok(clientVerification.RECOVERY_ACTIONS, 'client verification must define recovery actions');
+  });
+
+  it('every rejection code resolves to a non-empty message', () => {
+    assert.deepEqual(Object.keys(VERIFICATION_MESSAGES), VERIFICATION_CODES);
+    for (const code of VERIFICATION_CODES) {
+      assert.equal(typeof VERIFICATION_MESSAGES[code], 'string');
+      assert.ok(VERIFICATION_MESSAGES[code].length > 0, `${code} has no message`);
+      assert.equal(messageForCode(code), VERIFICATION_MESSAGES[code]);
+    }
   });
 });

@@ -162,6 +162,12 @@ function isActionableInvoice(invoice, now = Date.now()) {
 }
 
 module.exports = {
+  INVOICE_STATUSES,
+  allowedTransitions,
+  canTransition,
+  isTerminalStatus,
+  canCancelInvoice,
+  canPayInvoice,
   expiryTimestamp,
   hasInvoiceExpired,
   effectiveInvoiceStatus,

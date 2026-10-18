@@ -1,3 +1,5 @@
+import type { WalletGateResult } from './freighter-availability';
+
 export type PayStatus = 'idle' | 'paying' | 'verifying' | 'paid' | 'error' | 'expired';
 
 export interface PayInvoice {
@@ -14,6 +16,21 @@ export interface PaymentState {
   error: string | null;
 }
 
+export interface WalletGateSession {
+  freighterAvailable?: boolean | null;
+  connected?: boolean;
+  publicKey?: string | null;
+  network?: string | null;
+}
+
+export interface InvoiceUnavailableGate {
+  status: 'invoice_unavailable';
+  ready: false;
+  title: string;
+  message: string;
+  action: 'none';
+}
+
 export type PaymentEvent =
   | { type: 'INVOICE_LOADED'; invoice: PayInvoice | null }
   | { type: 'POLL_RESULT'; invoice: PayInvoice | null }
@@ -23,6 +40,7 @@ export type PaymentEvent =
   | { type: 'VERIFY_STARTED' }
   | { type: 'VERIFY_SUCCEEDED'; invoice?: PayInvoice | null; txHash?: string }
   | { type: 'VERIFY_FAILED'; error?: string }
+  | { type: 'VERIFY_UNAVAILABLE' }
   | { type: 'RESET' };
 
 export interface PayerDetails {
@@ -55,11 +73,19 @@ export function shouldShowPaymentControls(
 
 export function getPayPageView(invoice?: PayInvoice | null): {
   expired: boolean;
+  cancelled: boolean;
   paid: boolean;
   showPaymentControls: boolean;
   showProof: boolean;
   showMonitor: boolean;
 };
+
+export function getPayPageWalletGate(
+  invoice: PayInvoice | null | undefined,
+  session?: WalletGateSession,
+  expectedNetwork?: string,
+  now?: string | number | Date
+): WalletGateResult | InvoiceUnavailableGate;
 
 export function stateForStatus(statusOrInvoice: string | PayInvoice, now?: string | number | Date): PayStatus | null;
 export function initialPaymentState(invoice?: PayInvoice | null): PaymentState;
@@ -68,3 +94,7 @@ export function shouldPoll(state: PaymentState): boolean;
 export function normalizePayerDetails(details?: PayerDetails): PayerDetailsResult;
 export function describeVerifyError(error: unknown, fallback?: string): string;
 export function isLikelyTransactionHash(value?: string | null): boolean;
+export function isBusyState(state?: PaymentState | null): boolean;
+export function isResultState(state?: PaymentState | null): boolean;
+export function paymentStateKind(state?: PaymentState | null): 'status' | 'error';
+export function describePaymentState(state?: PaymentState | null): string;

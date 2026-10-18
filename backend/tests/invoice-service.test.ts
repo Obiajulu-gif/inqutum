@@ -42,6 +42,11 @@ class FakeInvoiceDb implements Queryable {
       row.payer_public_key = null;
       row.payer_name = null;
       row.payer_email = null;
+      row.cancelled_at = null;
+      row.settled_at = null;
+      row.settlement_context = null;
+      row.prior_status = null;
+      row.late_payment_warning_code = null;
       this.rows.push(row);
       return { rows: [{ ...row }], rowCount: 1 };
     }
@@ -55,33 +60,48 @@ class FakeInvoiceDb implements Queryable {
       return { rows: expired.map(row => ({ id: row.id })), rowCount: expired.length };
     }
 
-    if (sql.startsWith("UPDATE invoices SET status = 'PAID'")) {
+    if (sql.startsWith("UPDATE invoices SET status = 'PAID'") || sql.startsWith('WITH settled AS')) {
       const now = Date.now();
+      const settledAt = params[5] ? new Date(params[5]) : new Date();
       const row = this.rows.find(
         candidate => candidate.id === params[0] &&
-          candidate.status === 'PENDING' &&
-          new Date(candidate.expires_at).getTime() > now
+          (
+            (candidate.status === 'PENDING' && new Date(candidate.expires_at).getTime() > now) ||
+            (candidate.status === 'CANCELLED' && candidate.cancelled_at && Number.isFinite(settledAt.getTime()))
+          )
       );
       if (!row) {
         return { rows: [], rowCount: 0 };
       }
+      const priorStatus = row.status;
+      const afterCancel =
+        priorStatus === 'CANCELLED' &&
+        settledAt.getTime() >= new Date(row.cancelled_at).getTime();
       row.status = 'PAID';
       row.payment_tx_hash = params[1];
       row.payer_public_key = params[2];
       row.payer_name = params[3];
       row.payer_email = params[4];
       row.paid_at = new Date();
+      row.settled_at = settledAt;
+      row.settlement_context = afterCancel ? 'AFTER_CANCEL' : 'ON_TIME';
+      row.prior_status = priorStatus === 'CANCELLED' ? 'CANCELLED' : null;
+      row.late_payment_warning_code = afterCancel ? 'PAYMENT_RECEIVED_AFTER_CANCEL' : null;
       return { rows: [{ ...row }], rowCount: 1 };
     }
 
     if (sql.startsWith("UPDATE invoices SET status = 'CANCELLED'")) {
+      const sellerPublicKey = params[1] ?? null;
       const row = this.rows.find(
-        candidate => candidate.id === params[0] && candidate.status === 'PENDING'
+        candidate => candidate.id === params[0] &&
+          candidate.status === 'PENDING' &&
+          (!sellerPublicKey || candidate.seller_public_key === sellerPublicKey)
       );
       if (!row) {
         return { rows: [], rowCount: 0 };
       }
       row.status = 'CANCELLED';
+      row.cancelled_at = new Date();
       return { rows: [{ ...row }], rowCount: 1 };
     }
 
@@ -336,7 +356,12 @@ describe('InvoiceService (Postgres) seller scoping', () => {
 
     await assert.rejects(
       () => service.markAsPaid(created.id, 'e'.repeat(64), PAYER),
-      /Invoice not found, expired, or already processed/
+      (error: any) => {
+        assert.equal(error.code, 'INVALID_TRANSITION');
+        assert.equal(error.from, 'EXPIRED');
+        assert.equal(error.to, 'PAID');
+        return true;
+      }
     );
 
     const fetched = await service.getInvoiceById(created.id);
@@ -353,7 +378,26 @@ describe('InvoiceService (Postgres) seller scoping', () => {
 
     await assert.rejects(
       () => service.cancelInvoice(pending.id),
-      /Invoice not found or already processed/
+      (error: any) => {
+        assert.equal(error.code, 'INVALID_TRANSITION');
+        assert.equal(error.from, 'CANCELLED');
+        assert.equal(error.to, 'CANCELLED');
+        return true;
+      }
     );
+  });
+
+  it('cancelInvoice permits cancellation when sellerPublicKey matches and rejects when mismatched', async () => {
+    const db = new FakeInvoiceDb();
+    const service = new InvoiceService(db);
+    const pending = await service.createInvoice(input(SELLER_A, { amount: 1 }));
+
+    await assert.rejects(
+      () => service.cancelInvoice(pending.id, SELLER_B),
+      /Unauthorized: only the seller can cancel this invoice/
+    );
+
+    const cancelled = await service.cancelInvoice(pending.id, SELLER_A);
+    assert.equal(cancelled.status, 'CANCELLED');
   });
 });

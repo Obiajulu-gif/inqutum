@@ -1,7 +1,15 @@
 'use client';
 
-import { useState } from 'react';
-import { sendPayment, checkWalletConnection, requestWalletAccess } from '@/lib/stellar';
+import { useEffect, useRef, useState } from 'react';
+import {
+  sendPayment,
+  checkWalletConnection,
+  requestWalletAccess,
+  getFreighterNetwork,
+  isWrongNetwork,
+  NETWORK_DISPLAY_NAME,
+  EXPECTED_WALLET_NETWORK,
+} from '@/lib/stellar';
 import { toast } from 'sonner';
 import { Wallet, Loader2 } from 'lucide-react';
 import { invoiceApi } from '@/lib/api';
@@ -47,6 +55,36 @@ export default function PaymentButton({
   onError,
 }: PaymentButtonProps) {
   const [loading, setLoading] = useState(false);
+  const {
+    publicKey,
+    connected,
+    network,
+    freighterAvailable,
+    accountSwitchEpoch,
+    pendingAccountSwitch,
+  } =
+    useWalletStore();
+  const paymentEpochRef = useRef(accountSwitchEpoch);
+  const paymentAccountRef = useRef(publicKey);
+
+  useEffect(() => {
+    if (
+      loading &&
+      (accountSwitchEpoch !== paymentEpochRef.current ||
+        shouldInvalidateUnsignedPayment(paymentAccountRef.current, publicKey, loading))
+    ) {
+      setLoading(false);
+      // Freighter may still have its signing dialog open. Keep the attempt's
+      // original epoch so its eventual pre-broadcast check rejects the stale
+      // transaction even if the user confirms the newly active account first.
+      return;
+    }
+    if (!loading) paymentEpochRef.current = accountSwitchEpoch;
+  }, [accountSwitchEpoch, loading, publicKey]);
+  const gate = walletGate(
+    { freighterAvailable, connected, publicKey, network },
+    EXPECTED_WALLET_NETWORK
+  );
 
   const handlePayment = async () => {
     if (loading) return;
@@ -66,6 +104,9 @@ export default function PaymentButton({
       return;
     }
 
+    paymentEpochRef.current = accountSwitchEpoch;
+    paymentAccountRef.current = publicKey;
+    const attemptEpoch = accountSwitchEpoch;
     setLoading(true);
     onStart?.();
 
@@ -97,8 +138,34 @@ export default function PaymentButton({
         return;
       }
 
+      const netDetails = await getFreighterNetwork();
+      const wrong = isWrongNetwork(netDetails?.networkPassphrase || netDetails?.network);
+      if (wrong) {
+        showFreighterWrongNetworkPrompt(NETWORK_DISPLAY_NAME);
+        const wrongMsg = `Wallet is connected to the wrong network. Please switch to ${NETWORK_DISPLAY_NAME} in Freighter.`;
+        toast.error(wrongMsg);
+        onError?.(wrongMsg);
+        return;
+      }
+
       toast.loading('Confirm in wallet...', { id: PAY_TOAST_ID });
-      const txHash = await sendPayment(destination, amount, memo, assetCode, assetIssuer);
+      if (useWalletStore.getState().accountSwitchEpoch !== paymentEpochRef.current) {
+        throw new Error('Freighter account changed during payment');
+      }
+      const txHash = await sendPayment(
+        destination,
+        amount,
+        memo,
+        assetCode,
+        assetIssuer,
+        (sourceAccount) => {
+          const current = useWalletStore.getState();
+          return (
+            current.publicKey === sourceAccount &&
+            current.accountSwitchEpoch === attemptEpoch
+          );
+        }
+      );
 
       if (invoiceId) {
         toast.loading('Verifying payment...', { id: PAY_TOAST_ID });
@@ -115,7 +182,10 @@ export default function PaymentButton({
           // Surface the shared rejection message rather than a generic warning.
           toast.warning('Payment sent but verification failed', {
             id: PAY_TOAST_ID,
-            description: describeVerifyError(error, 'Refresh the page or wait for status to update'),
+            description: describeVerifyError(
+              error,
+              'Refresh the page or wait for status to update'
+            ),
           });
         }
       } else {
@@ -140,6 +210,16 @@ export default function PaymentButton({
   };
 
   return (
+    /*
+     * The accessible name spells out the amount and asset (issue #289). "Pay
+     * with Freighter" on its own does not say what is about to leave the
+     * payer's wallet, and the amount lives in a separate panel rendered with
+     * `bg-clip-text`, so a screen-reader user confirming a payment had no way
+     * to hear the figure from the control itself.
+     *
+     * `aria-busy` reports the in-flight attempt; the label change to
+     * "Processing..." covers the visual side.
+     */
     <button
       type="button"
       onClick={handlePayment}
@@ -148,7 +228,14 @@ export default function PaymentButton({
       disabled={!destination || !amount || invoiceStatus !== 'PENDING'}
       aria-disabled={loading}
       aria-busy={loading}
-      data-payment-state={loading ? 'processing' : 'ready'}
+      data-payment-state={loading ? 'processing' : gate.status}
+      aria-label={
+        loading
+          ? `Processing payment of ${amount} ${assetCode}`
+          : gate.ready
+            ? `Pay ${amount} ${assetCode} with Freighter`
+            : gate.message
+      }
       className="btn btn-primary w-full flex items-center justify-center gap-2 text-lg py-4"
     >
       {loading ? (

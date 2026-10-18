@@ -3,8 +3,11 @@
 import { useState } from 'react';
 import { apiErrorMessage, invoiceApi, isApiUnavailableError } from '@/lib/api';
 import { toast } from 'sonner';
-import { Loader2 } from 'lucide-react';
+import { Loader2, AlertTriangle } from 'lucide-react';
 import { STELLAR_ASSETS, getAssetByCode } from '@/lib/assets';
+import { useWalletStore } from '@/lib/store';
+import { NETWORK_DISPLAY_NAME } from '@/lib/stellar';
+import { showFreighterWrongNetworkPrompt } from './FreighterInstallPrompt';
 import AssetLogo from './AssetLogo';
 import ApiErrorState from './ApiErrorState';
 import {
@@ -27,6 +30,7 @@ interface InvoiceFormProps {
 }
 
 export default function InvoiceForm({ onSuccess, userWallet }: InvoiceFormProps) {
+  const { publicKey, connected, network, freighterAvailable } = useWalletStore();
   const [loading, setLoading] = useState(false);
   const [amount, setAmount] = useState('');
   const [assetCode, setAssetCode] = useState('XLM');
@@ -122,10 +126,14 @@ export default function InvoiceForm({ onSuccess, userWallet }: InvoiceFormProps)
         <label className="label" htmlFor={FIELD_IDS.amount}>Invoice Amount *</label>
         <div className="flex gap-3 flex-col sm:flex-row">
           <input
+            id="invoice-amount"
+            name="amount"
             type="number"
             step="0.0000001"
             min="0.0000001"
             required
+            aria-required="true"
+            aria-describedby="invoice-amount-hint"
             className="input flex-1 text-2xl font-semibold"
             {...errorProps('amount')}
             placeholder="10.00"
@@ -133,6 +141,9 @@ export default function InvoiceForm({ onSuccess, userWallet }: InvoiceFormProps)
             onChange={(e) => setAmount(e.target.value)}
           />
           <div className="relative">
+            <label htmlFor="invoice-asset" className="sr-only">
+              Asset
+            </label>
             <select
               aria-label="Asset"
               value={assetCode}
@@ -145,8 +156,13 @@ export default function InvoiceForm({ onSuccess, userWallet }: InvoiceFormProps)
                 </option>
               ))}
             </select>
+            {/*
+              The logo repeats the asset code already announced by the select's
+              own value, so it is hidden from assistive technology rather than
+              read twice.
+            */}
             <div className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">
-              <AssetLogo code={assetCode} size={24} showName={false} />
+              <AssetLogo code={assetCode} size={24} showName={false} decorative />
             </div>
           </div>
         </div>
@@ -191,6 +207,7 @@ export default function InvoiceForm({ onSuccess, userWallet }: InvoiceFormProps)
           <input
             id="invoice-seller-name"
             type="text"
+            autoComplete="name"
             className="input text-sm"
             placeholder="Your name or business"
             value={sellerName}
@@ -202,7 +219,10 @@ export default function InvoiceForm({ onSuccess, userWallet }: InvoiceFormProps)
         <div>
           <label className="label" htmlFor={FIELD_IDS.sellerEmail}>Your email (optional)</label>
           <input
+            id="seller-email"
+            name="sellerEmail"
             type="email"
+            autoComplete="email"
             className="input text-sm"
             {...errorProps('sellerEmail')}
             placeholder="you@example.com"
@@ -230,7 +250,10 @@ export default function InvoiceForm({ onSuccess, userWallet }: InvoiceFormProps)
       <div>
         <label className="label" htmlFor={FIELD_IDS.customerEmail}>Client email (optional)</label>
         <input
+          id="customer-email"
+          name="customerEmail"
           type="email"
+          aria-describedby="customer-email-hint"
           className="input text-sm"
           {...errorProps('customerEmail', 'invoice-customer-email-hint')}
           placeholder="client@example.com — for sending the invoice"

@@ -16,6 +16,13 @@ import { pool } from '../config/database';
 import { EmailDeliveryService } from '../notifications/email-delivery';
 import { PostgresCheckpointStore } from '../recovery/side-effect-checkpoint';
 import { healthHandler, readinessHandler } from '../health';
+import { PostgresIdempotencyStore } from '../idempotency/postgres-store';
+import { createAuthRouter } from './auth.routes';
+import { createReconciliationRouter } from './reconciliation.routes';
+import { createEmailRouter } from './email.routes';
+import { authenticate, requirePermission } from '../middleware/access-control';
+import { createQuotaRouter } from './quota.routes';
+import { createAnalyticsRouter } from './analytics.routes';
 
 const router: Router = Router();
 
@@ -40,28 +47,27 @@ router.use(createOpsRouter({ storage: postgresInvoiceStorage, jobs: jobStore }))
 const webhookRouter = createWebhookRouter({});
 if (webhookRouter) router.use(webhookRouter);
 
-// Stellar routes
+// Bulk import (issue #53). Dry run by default; opt in with dryRun: false.
+router.use(createImportRouter({ storage: postgresInvoiceStorage }));
+
+// Email delivery & queue routes
+router.use(createEmailRouter({ storage: postgresInvoiceStorage }));
+router.use(createQuotaRouter());
+router.use(createAnalyticsRouter());
+
+// Wallet sign-in and role introspection
+router.use(createAuthRouter());
+
+// Read-only reconciliation dry run (operators and services only)
+router.use(createReconciliationRouter({ storage: postgresInvoiceStorage }));
+
+// Stellar routes. These proxy Horizon on the server's quota, so they need a
+// signed-in caller rather than being an open relay.
+router.use('/stellar', authenticate(), requirePermission('stellar:read'));
 router.get('/stellar/account', stellarController.getAccountInfo.bind(stellarController));
 router.get('/stellar/payments', stellarController.getPayments.bind(stellarController));
 router.get('/stellar/transaction/:hash', stellarController.getTransaction.bind(stellarController));
 router.post('/stellar/verify-payment', stellarController.verifyPayment.bind(stellarController));
-
-// Payment monitoring routes
-router.post('/payment/sync', async (req, res) => {
-  try {
-    const limit = req.body.limit || 50;
-    await paymentMonitorService.manualSync(limit);
-    res.json({
-      success: true,
-      message: `Payment sync completed`,
-      limit
-    });
-  } catch (error: any) {
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Sync failed'
-    });
-  }
-});
+router.use(createPaymentMonitorRouter(paymentMonitorService));
 
 export default router;

@@ -26,11 +26,46 @@ export interface ApiSuccess<T> {
   success: true;
   data: T;
   message?: string;
+  code?: string;
+  warning?: string;
   pagination?: ApiPagination;
   correlationId?: string;
   /** Schema version of the data payload, when applicable. */
   apiVersion?: string;
 }
+
+/**
+ * Stable machine-readable codes for failures that are not payment-verification
+ * rejections. Clients branch on these, never on the human-readable `error`.
+ */
+export type ApiErrorCode =
+  | 'INVALID_TRANSITION'
+  | 'INVOICE_NOT_FOUND'
+  | 'UNAUTHENTICATED'
+  | 'FORBIDDEN'
+  | 'INVALID_WALLET_PROOF'
+  | 'SESSION_UNAVAILABLE'
+  | 'IDEMPOTENCY_KEY_INVALID'
+  | 'IDEMPOTENCY_KEY_REQUIRED'
+  | 'IDEMPOTENCY_KEY_CONFLICT'
+  | 'IDEMPOTENCY_KEY_EXPIRED'
+  | 'IDEMPOTENCY_IN_PROGRESS'
+  | 'IDEMPOTENCY_STORE_UNAVAILABLE'
+  | 'MISSING_RECIPIENT_EMAIL'
+  | 'INVOICE_NOT_PAID'
+  | 'EMAIL_RATE_LIMIT_EXCEEDED'
+  | 'CIRCUIT_BREAKER_OPEN'
+  | 'INVALID_EMAIL_RECIPIENT'
+  | 'CRLF_INJECTION_DETECTED'
+  | 'DISPOSABLE_EMAIL_REJECTED'
+  | 'PENDING_INVOICE_LIMIT_EXCEEDED'
+  | 'EXCEEDED_INVOICE_EMAIL_LIMIT'
+  // Bulk import (issue #53)
+  | 'INVALID_IMPORT_REQUEST'
+  | 'INVALID_IMPORT_PAYLOAD'
+  | 'INVALID_EMAIL'
+  | 'QUOTA_EXCEEDED'
+  | 'INVALID_QUOTA_REQUEST';
 
 export interface ApiFailure {
   success: false;
@@ -53,6 +88,12 @@ export function apiSuccess<T>(
 
   if (extra?.message) {
     body.message = extra.message;
+  }
+  if (extra?.code) {
+    body.code = extra.code;
+  }
+  if (extra?.warning) {
+    body.warning = extra.warning;
   }
   if (extra?.pagination) {
     body.pagination = extra.pagination;
@@ -163,6 +204,26 @@ export function sendVerificationFailure(
     ...(corrId ? { correlationId: corrId } : {}),
     timestamp: new Date().toISOString(),
   });
+}
+
+/**
+ * The envelope a verification rejection is returned in.
+ *
+ * `success` is the literal `false` rather than `boolean` so this discriminates
+ * from a success envelope at the type level instead of only at runtime.
+ */
+export interface VerificationFailureBody {
+  success: false;
+  code: VerificationCode;
+  error: string;
+}
+
+/** Build a verification failure envelope with a stable code and its message. */
+export function verificationFailureBody(
+  code: VerificationCode,
+  error: string
+): VerificationFailureBody {
+  return { success: false, code, error };
 }
 
 export default {

@@ -7,7 +7,7 @@
 import { Request, Response } from 'express';
 import { performance } from 'perf_hooks';
 import stellarService from '../services/stellar.service';
-import { createInvoiceSchema } from '../utils/validation';
+import { cancelInvoiceSchema, createInvoiceSchema, stellarPublicKeySchema } from '../utils/validation';
 import { generatePaymentQR, generateStellarPaymentQR } from '../utils/qrcode';
 import { sendFailure, sendSuccess, sendVerificationFailure } from '../types/api';
 import { INVOICE_STATUSES, type InvoiceStatus, type InvoiceStorage, type StoredInvoice } from '../storage/invoice-storage';
@@ -19,6 +19,7 @@ import {
   checkInvoiceIsPayable,
   checkPayerInfo,
   checkTxHash,
+  messageForCode,
   verifyHorizonPayment,
 } from '../services/payment-verification';
 import { simulationAllowed } from '../config/runtime';
@@ -63,6 +64,8 @@ export interface InvoiceHandlerOptions {
 }
 
 export interface InvoiceHandlers {
+  getLifecycle(req: Request, res: Response): Promise<void>;
+  getAuditTrail(req: Request, res: Response): Promise<void>;
   createInvoice(req: Request, res: Response): Promise<void>;
   getInvoice(req: Request, res: Response): Promise<void>;
   getInvoices(req: Request, res: Response): Promise<void>;
@@ -85,8 +88,9 @@ export interface InvoiceHandlers {
  * (zod) cannot be inspected by `console` on newer Node versions, and the throw
  * would escape the catch block and leave the request hanging.
  */
-function logError(label: string, error: any): void {
-  console.error(label, error?.stack || error?.message || error);
+function logError(label: string, error: any, requestId?: string): void {
+  const prefix = requestId ? `[${requestId}] ` : '';
+  console.error(`${prefix}${label}`, error?.stack || error?.message || error);
 }
 
 function toPositiveInt(value: unknown, fallback: number): number {
@@ -99,6 +103,23 @@ function getUserAgent(req: Request): string | undefined {
     return req.get('user-agent');
   }
   return (req.headers && req.headers['user-agent']) as string | undefined;
+}
+
+/**
+ * Whether the local-only simulate endpoint is switched on. Shared by the route
+ * (which hides the endpoint entirely when off) and the handler, so the two can
+ * never disagree about when "simulation is disabled" applies.
+ */
+export function isSimulationEnabled(options: Pick<InvoiceHandlerOptions, 'allowSimulate'>): boolean {
+  return (
+    process.env.NODE_ENV !== 'production' &&
+    (options.allowSimulate !== undefined ? options.allowSimulate : simulationAllowed())
+  );
+}
+
+/** 400 with a stable code: the invoice's state does not allow the requested move. */
+function sendInvalidTransition(res: Response, error: InvalidTransitionError): void {
+  sendFailure(res, 400, error.message, error.code, { from: error.from, to: error.to });
 }
 
 /**
@@ -125,12 +146,7 @@ export function createInvoiceHandlers(options: InvoiceHandlerOptions): InvoiceHa
   const frontendUrl = () =>
     safeFrontendOrigin(options.frontendUrl || process.env.FRONTEND_URL);
 
-  const simulateAllowed = () =>
-    process.env.NODE_ENV !== 'production' && (
-      options.allowSimulate !== undefined
-        ? options.allowSimulate
-        : simulationAllowed()
-    );
+  const simulateAllowed = () => isSimulationEnabled(options);
 
   const buildPaymentPayload = async (invoice: StoredInvoice) => {
     const paymentUrl = `${frontendUrl()}/pay/${invoice.id}`;
@@ -152,7 +168,7 @@ export function createInvoiceHandlers(options: InvoiceHandlerOptions): InvoiceHa
       stellarQrCode: await generateStellarPaymentQR(
         invoice.sellerPublicKey,
         invoice.amount.toString(),
-        invoice.assetCode,
+        invoice.assetCode || 'XLM',
         invoice.memo,
         invoice.assetIssuer
       ),
@@ -160,12 +176,84 @@ export function createInvoiceHandlers(options: InvoiceHandlerOptions): InvoiceHa
   };
 
   return {
+    // The lifecycle the UI and API both derive state from. Static, so it is safe
+    // to serve to anyone and to cache.
+    async getLifecycle(_req: Request, res: Response) {
+      sendSuccess(res, 200, describeLifecycle());
+    },
+
+    // Who did what to an invoice, oldest first. Owner, maintainer or service only.
+    async getAuditTrail(req: Request, res: Response) {
+      try {
+        const invoice = await storage.getInvoiceById(req.params.id);
+        if (!invoice) {
+          return sendFailure(res, 404, 'Invoice not found', 'INVOICE_NOT_FOUND');
+        }
+        if (!mayAccessSeller(req.actor, 'invoice:audit', invoice.sellerPublicKey)) {
+          return sendForbiddenOwnership(res);
+        }
+
+        sendSuccess(res, 200, await storage.getAuditTrail(invoice.id));
+      } catch (error: any) {
+        logError('Get audit trail error:', error);
+        sendFailure(res, 500, error.message || 'Failed to get audit trail');
+      }
+    },
+
     async createInvoice(req: Request, res: Response) {
       const start = performance.now();
       const corrId = req.correlationId || `req-${Date.now().toString(36)}`;
 
       try {
         const validatedData = createInvoiceSchema.parse(req.body);
+        // A seller may only issue invoices payable to their own wallet.
+        if (!mayAccessSeller(req.actor, 'invoice:create', validatedData.sellerPublicKey)) {
+          return sendForbiddenOwnership(res);
+        }
+        if (validatedData.network && validatedData.network !== STELLAR_NETWORK) {
+          return sendFailure(res, 400, 'Client wallet network does not match the server Stellar network');
+        }
+        const quota = quotaManager.reserve('invoice_create', {
+          actor: req.actor?.wallet ?? validatedData.sellerPublicKey,
+          resource: validatedData.sellerPublicKey,
+        });
+        if (!quota.allowed) {
+          res.set('Retry-After', String(quota.retryAfterSeconds));
+          return sendFailure(res, 429, quota.message, quota.code, { usage: quota.usage });
+        }
+
+        // Demo abuse prevention (Issue #31): Reject disposable email addresses for customer notifications
+        if (validatedData.customerEmail && emailAntiSpamService.isDisposableDomain(validatedData.customerEmail)) {
+          return sendFailure(
+            res,
+            400,
+            'Disposable and temporary email addresses are not permitted on the demo platform',
+            'DISPOSABLE_EMAIL_REJECTED'
+          );
+        }
+
+        // Demo abuse prevention (Issue #31): Enforce max pending invoices per wallet
+        const maxPending = process.env.MAX_PENDING_INVOICES_PER_SELLER
+          ? parseInt(process.env.MAX_PENDING_INVOICES_PER_SELLER, 10)
+          : (isDemoEnvironment() ? 25 : undefined);
+        if (maxPending !== undefined) {
+          try {
+            const pendingInvoices = await storage.getInvoicesBySeller(validatedData.sellerPublicKey, 'PENDING');
+            if (pendingInvoices.length >= maxPending) {
+              return sendFailure(
+                res,
+                429,
+                `Pending invoice limit reached for this wallet (${maxPending}). Please settle or cancel open invoices before creating new ones.`,
+                'PENDING_INVOICE_LIMIT_EXCEEDED'
+              );
+            }
+          } catch (e: any) {
+            if (!/Unhandled query/i.test(e.message)) {
+              throw e;
+            }
+          }
+        }
+
         const invoice = await storage.createInvoice(validatedData);
         const payment = await buildPaymentPayload(invoice);
 
@@ -327,6 +415,14 @@ export function createInvoiceHandlers(options: InvoiceHandlerOptions): InvoiceHa
             code: 'SELLER_REQUIRED',
             correlationId: corrId,
           });
+        }
+        const sellerCheck = stellarPublicKeySchema.safeParse(sellerPublicKey);
+        if (!sellerCheck.success) {
+          return sendFailure(res, 400, 'sellerPublicKey must be a valid Stellar public key');
+        }
+
+        if (!mayAccessSeller(req.actor, 'invoice:list', sellerCheck.data)) {
+          return sendForbiddenOwnership(res);
         }
 
         // Status is matched case-insensitively so API and UI filters agree on both backends.
@@ -632,6 +728,17 @@ export function createInvoiceHandlers(options: InvoiceHandlerOptions): InvoiceHa
           return sendVerificationFailure(res, 400, statusCheck.code, statusCheck.error, corrId);
         }
 
+        // Reserve immediately before the Horizon call: malformed or terminal
+        // requests consume no external quota, while every remote lookup does.
+        const quota = quotaManager.reserve('horizon_verify', {
+          actor: req.actor?.wallet ?? req.ip ?? 'anonymous',
+          resource: id,
+        });
+        if (!quota.allowed) {
+          res.set('Retry-After', String(quota.retryAfterSeconds));
+          return sendFailure(res, 429, quota.message, quota.code, { usage: quota.usage });
+        }
+
         let txDetails;
         try {
           txDetails = await stellar.getTransaction(hashCheck.value);
@@ -698,7 +805,24 @@ export function createInvoiceHandlers(options: InvoiceHandlerOptions): InvoiceHa
             payerCheck.value,
             paymentExpectedVersion
           );
+          
+          // Cache successful verification
+          await cacheVerificationResult(id, hashCheck.value, 'verified');
         } catch (error) {
+          if (error instanceof PaymentClaimError) {
+            // A transaction that already settled another invoice must not settle
+            // this one as well. 409, not 400: the request is well formed and it
+            // is the server's recorded state that refuses it.
+            return sendVerificationFailure(res, 409, error.code, messageForCode(error.code));
+          }
+          if (error instanceof SettlementTimeUnavailableError) {
+            return sendVerificationFailure(
+              res,
+              503,
+              'TRANSACTION_CLOSE_TIME_UNAVAILABLE',
+              messageForCode('TRANSACTION_CLOSE_TIME_UNAVAILABLE')
+            );
+          }
           // The payment lookup can cross expiresAt after the first status read.
           // Re-read so that race still returns the public expiry contract.
           const latest = await storage.getInvoiceById(id);
@@ -721,6 +845,9 @@ export function createInvoiceHandlers(options: InvoiceHandlerOptions): InvoiceHa
               latestStatus.error,
               corrId
             );
+          }
+          if (error instanceof InvalidTransitionError) {
+            return sendInvalidTransition(res, error);
           }
           throw error;
         }
@@ -827,6 +954,10 @@ export function createInvoiceHandlers(options: InvoiceHandlerOptions): InvoiceHa
             code: 'SELLER_REQUIRED',
             correlationId: corrId,
           });
+        }
+        const sellerCheck = stellarPublicKeySchema.safeParse(sellerPublicKey);
+        if (!sellerCheck.success) {
+          return sendFailure(res, 400, 'sellerPublicKey must be a valid Stellar public key');
         }
 
         const stats = await storage.getInvoiceStats(sellerPublicKey as string);

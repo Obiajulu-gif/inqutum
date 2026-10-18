@@ -1,8 +1,8 @@
-# Quittance
+# Inqutum
 
 Invoice on Stellar. Get paid. Keep the proof.
 
-Quittance helps freelancers create an invoice, accept payment via link or QR on Stellar, verify it on Horizon (memo + amount + destination), then **download or email payment proof**. Settlement stays on-chain. Quittance does not expose other people’s wallet identity or history.
+Inqutum helps freelancers create an invoice, accept payment via link or QR on Stellar, verify it on Horizon (memo + amount + destination), then **download or email payment proof**. Settlement stays on-chain. Inqutum does not expose other people’s wallet identity or history.
 
 **Sharp initial user:** freelancer invoicing a client in XLM/USDC on Stellar.
 
@@ -36,6 +36,22 @@ Ship plan: [`PLAN.md`](./PLAN.md).
 5. **Download Proof** (primary) or **Email Proof** (if client email exists)  
 
 Identity is the **wallet**. Email is an **optional delivery channel**, not a login gate.
+
+---
+
+## Wallet session contract
+
+Freighter is the only wallet gate for create and pay. The frontend stores one
+session snapshot in `frontend/lib/store.ts`: extension availability, public key,
+active Freighter network, network passphrase, balance, and connection state.
+`WalletSessionSync` refreshes that snapshot on every route and watches Freighter
+for account or network changes without reloading the page.
+
+Landing, dashboard, create, pay, and invoice-detail all use the same gate matrix:
+install Freighter when the extension is missing, connect Freighter when no public
+key is available, switch networks when Freighter is not on
+`NEXT_PUBLIC_STELLAR_NETWORK`, and continue only when the wallet is connected on
+the expected network.
 
 ---
 
@@ -88,6 +104,15 @@ The client mirror lets the pay page reject malformed input before a round trip
 and show the exact message the server would return. A test asserts the two
 tables stay identical — if you add a code, add it in **both** files.
 
+Those codes are also how the app keeps every page on one copy of the wording.
+`frontend/lib/verification.js` exposes `messageForCode(code)`; the API layer
+(`api-runtime.js` / `apiErrorMessage`) and the pay page (`describeVerifyError`)
+resolve a stable `code` to that message before falling back to server text, so
+the pay page, invoice detail, dashboard, and monitoring banners all read
+identically for the same rejection. `VERIFICATION_CODES` and `messageForCode`
+are exported from `backend/src/services/payment-verification.ts` as well, so a
+test pins the two layers together.
+
 Amounts compare at Stellar's 7-decimal (stroop) precision, so `100` and
 `100.0000000` match while a partial payment does not.
 
@@ -101,9 +126,40 @@ invoices to `EXPIRED` before get, list, stats, verify, cancel, or monitor work.
 Expired invoices remain visible in seller history, but they are excluded from
 pending/actionable counts and cannot expose QR, pay, verify, or payment-proof
 controls. The client also projects stale pending data through `expiresAt` so a
-page fails closed while it waits for the next authoritative server response.
+cached invoice stops offering payment after its deadline.
+
+The policy for exact payments that land across an expiry or cancellation
+boundary is documented in [`docs/LATE_PAYMENT_POLICY.md`](./docs/LATE_PAYMENT_POLICY.md).
+
+### Multi-Asset (XLM & USDC) Support
+
+Inqutum supports multi-asset invoicing across native XLM and credit assets such as USDC on Stellar:
+- **Native XLM**: No issuer required, verified directly with native payment operations.
+- **Credit Assets (e.g. USDC)**: Verified with `asset_type`, `asset_code`, and pinned `asset_issuer`.
+- **Trustline UX**: The pay flow inspects trustline status and provides actionable guidance (`op_no_trust` handling) if the buyer wallet needs to add a trustline.
+
+### Seller invoice management & cancellation
+
+Sellers manage their invoices from the dashboard and detail views:
+- **Cancel Pending Invoices**: Sellers can cancel any pending invoice before payment or expiration. Cancellation is strictly gated on wallet ownership: `POST /api/invoices/:id/cancel` verifies the request against the invoice's `sellerPublicKey` (returning `403 Forbidden` on a mismatch).
+- **Copy Pay & Share Links**: Direct quick-copy actions with toast feedback for pay URLs and invoice IDs across dashboard cards and detail pages.
+- **Proof & Receipt Navigation**: One-click jump to verified PDF payment proof and transaction details for all `PAID` invoices.
 
 ---
+
+## Design notes: lifecycle, access control, retries, reconciliation
+
+| Topic | Doc |
+| ----- | --- |
+| Invoice state machine shared by API, stores and UI | [docs/LIFECYCLE.md](docs/LIFECYCLE.md) |
+| Roles, permissions and wallet sign-in | [docs/ACCESS-CONTROL.md](docs/ACCESS-CONTROL.md) |
+| Retry-safe writes with `Idempotency-Key` | [docs/IDEMPOTENCY.md](docs/IDEMPOTENCY.md) |
+| Read-only drift detection (`npm run reconcile`) | [docs/RECONCILIATION.md](docs/RECONCILIATION.md) |
+| Bulk invoice import, dry run and rollback | [docs/IMPORTS.md](docs/IMPORTS.md) |
+
+Sellers now sign in with their wallet before creating, listing or cancelling
+invoices. Set `AUTH_SESSION_SECRET` (and run `npm run db:migrate`) before deploying;
+see the docs above.
 
 ## Stack
 
@@ -132,6 +188,10 @@ server.ts ─────┘                                    └─ postgres-
 
 A bug fix in a handler applies to both servers at once.
 
+The event taxonomy, correlation rules, redacted JSON examples, and PaaS metric
+queries for this request path are defined in
+[`docs/STRUCTURED_LOGGING.md`](./docs/STRUCTURED_LOGGING.md).
+
 ---
 
 ## Requirements
@@ -159,8 +219,8 @@ Only use your public `G...` address with Friendbot. Never paste a secret key or 
 Follow these steps from a fresh clone. Use **two terminals** so the backend and frontend can run at the same time.
 
 ```bash
-git clone https://github.com/Kappa16/Quittance0.git
-cd Quittance0
+git clone https://github.com/BigDella/inqutum.git
+cd inqutum
 ```
 
 ### 1) Backend API
@@ -224,17 +284,24 @@ Use this path when invoices must survive a backend restart. Identity is still th
 connected Freighter wallet: every invoice is stored under its `seller_public_key`,
 and list/stats endpoints only return the requesting wallet's invoices.
 
+For a live move from the MVP without changing existing `/pay/[id]` links or
+payment proofs, follow the [in-memory to Postgres cutover plan](./docs/POSTGRES_CUTOVER.md).
+
 ### 1) Point the backend at a database
 
 In `backend/.env` (template: `backend/env.example.txt`):
 
 ```
-DATABASE_URL=postgresql://user:password@localhost:5432/quittance
+DATABASE_URL=postgresql://user:password@localhost:5432/inqutum
 ```
 
 `SELLER_PUBLIC_KEY` / `SELLER_SECRET_KEY` are **optional**. They are only used by
 the single-account Horizon payment monitor; without them the server starts in
 wallet-scoped mode and the monitor stays off.
+
+The monitor polls from a durable Horizon paging token and resumes after
+restarts. Its recovery model, failure matrix, operator endpoint, and Testnet
+restart evidence are documented in [`docs/PAYMENT_MONITOR.md`](./docs/PAYMENT_MONITOR.md).
 
 ### 2) Migrate and seed
 
@@ -270,7 +337,7 @@ cd backend
 npm run typecheck                                                     # TypeScript compile check (no emit)
 npm test                                                              # unit + scoping + parity tests
 npm run test:isolated                                                 # standalone regression tests in tests/isolated
-DATABASE_URL=postgresql://user:password@localhost:5432/quittance_test npm test   # adds the Postgres integration test
+DATABASE_URL=postgresql://user:password@localhost:5432/inqutum_test npm test   # adds the Postgres integration test
 ```
 
 The integration test (`backend/tests/invoice-postgres.integration.test.ts`) is
@@ -303,7 +370,6 @@ parity between memory and Postgres stays pinned by the same assertions.
 | `NEXT_PUBLIC_STELLAR_NETWORK` | `TESTNET` |
 | `NEXT_PUBLIC_HORIZON_URL` | `https://horizon-testnet.stellar.org` |
 | `NEXT_PUBLIC_APP_URL` | `https://YOUR-APP.vercel.app` |
-| `NEXT_PUBLIC_USE_MOCK` | `false` |
 
 4. Run `npm run deploy:check` locally with the same variables before deploying.
 5. Deploy. A missing/invalid production API URL fails closed in the UI with an
@@ -397,9 +463,18 @@ cd backend && npm ci && npm run typecheck && npm test
 # Frontend: lint + typecheck + unit tests
 cd frontend && npm ci && npm run lint && npm run typecheck && npm test
 
+# Frontend: focused axe, focus-management, live-region, and contrast checks
+cd frontend && npm run test:a11y
+
 # Shared export helpers (repository root)
 node --test "tests/**/*.test.mjs"
 ```
+
+The focused accessibility suite renders the landing, dashboard, pay, and
+invoice-detail routes in jsdom, audits them with axe, and directly checks the
+focus and live-region behavior that a static axe scan cannot observe. Because
+jsdom has no layout engine, WCAG contrast ratios are verified separately from
+the color pairs declared in `frontend/tailwind.config.js`.
 
 ### The invoice payment loop is covered end to end
 
@@ -440,6 +515,10 @@ For a manual testnet pass with a real Freighter payment, see
 ## Demo & evidence
 
 Reviewer pack: **[`EVIDENCE.md`](./EVIDENCE.md)** (URLs, testnet tx hashes, recording, tech note).
+
+After deployment, `cd backend && npm run evidence:smoke -- --write-evidence`
+runs the real Testnet create → pay → verify path and fills the reviewer tables;
+the required secret and public variables are listed in `EVIDENCE.md`.
 
 | Item | Status |
 |------|--------|

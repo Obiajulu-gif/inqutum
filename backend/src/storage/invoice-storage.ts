@@ -1,12 +1,16 @@
 import { CreateInvoiceInput } from '../utils/validation';
+import type {
+  LatePaymentWarningCode,
+  SettlementContext,
+} from '../domain/invoice-settlement';
 import type { InvoiceStats } from './invoice-stats';
 import type { AuditEvent, AuditFilter, AuditQueryResult } from '../audit/audit-service';
 
 // Shared shape and shared storage contract. Both MemoryInvoiceStorage and
 // PostgresInvoiceStorage implement these methods with the same semantics,
 // and every invoice they return is the StoredInvoice type below. Behaviour
-// parity (expiry guard on markAsPaid, single-transition PENDING->CANCELLED,
-// PENDING->PAID only when expiresAt still in the future, lazy
+// parity (expiry guard on normal markAsPaid, cancel-aware late settlement,
+// single-transition PENDING->CANCELLED, lazy
 // markExpiredInvoices on all reads, strict seller_public_key scoping on list
 // and stats, and audit trail capture) is pinned by the shared test suite in invoice-handlers.test.ts.
 import type { InvoiceCursor } from './invoice-cursor';
@@ -22,9 +26,13 @@ export interface StoredInvoice {
   sellerName?: string;
   sellerEmail?: string;
   amount: number;
+  /** Asset code for the invoice (e.g., 'XLM' or 'USDC'). */
   assetCode: string;
+  /** Issuer public key for credit assets (omitted for native XLM). */
   assetIssuer?: string;
   memo: string;
+  /** Caller-supplied import key (issue #53). Unique where present. */
+  externalId?: string;
   description?: string;
   customerName?: string;
   customerEmail?: string;
@@ -35,6 +43,11 @@ export interface StoredInvoice {
   payerEmail?: string;
   createdAt: Date;
   paidAt?: Date;
+  cancelledAt?: Date;
+  settledAt?: Date;
+  settlementContext?: SettlementContext;
+  priorStatus?: InvoiceStatus;
+  latePaymentWarningCode?: LatePaymentWarningCode;
   expiresAt: Date;
   metadata?: any;
   /** Schema version stamp. Absent on records created before versioning. */

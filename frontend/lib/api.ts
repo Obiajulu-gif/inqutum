@@ -7,6 +7,11 @@ import {
   resolveApiConfig,
   toApiError,
 } from './api-runtime';
+import { resolveVerificationError } from './verification';
+import { Networks } from '@stellar/stellar-sdk';
+import { createSessionManager, installWalletAuth } from './auth-session.ts';
+import { useWalletStore } from './store';
+import { newIdempotencyKey } from './idempotency-key.ts';
 
 const USE_MOCK_API = process.env.NEXT_PUBLIC_USE_MOCK === 'true';
 export const API_CONFIG = resolveApiConfig(
@@ -23,6 +28,39 @@ const api = axios.create({
   },
 });
 
+// Sellers prove wallet ownership once per session (see docs/ACCESS-CONTROL.md);
+// this attaches the resulting token and signs in on demand when the server asks.
+// Installed before the error normaliser below so it sees the raw 401. Hidden
+// buttons are a courtesy: the server refuses unauthorised calls regardless.
+if (!USE_MOCK_API) {
+  const networkPassphrase =
+    (process.env.NEXT_PUBLIC_STELLAR_NETWORK || 'TESTNET').toUpperCase() === 'PUBLIC'
+      ? Networks.PUBLIC
+      : Networks.TESTNET;
+
+  installWalletAuth(
+    api,
+    createSessionManager({
+      getWallet: () => useWalletStore.getState().publicKey,
+      networkPassphrase,
+      storage: typeof window !== 'undefined' ? window.sessionStorage : null,
+      signChallenge: async (xdr) => {
+        const { signTransaction } = await import('@stellar/freighter-api');
+        const result: any = await signTransaction(xdr, { networkPassphrase });
+        const signed =
+          typeof result === 'string' ? result : result?.signedTxXdr ?? result?.signedTransaction;
+        if (!signed) throw new Error('Freighter did not return a signed sign-in challenge');
+        return signed;
+      },
+      // Bare axios: this call must not pass through the interceptor it serves.
+      exchange: async (transaction) => {
+        const response = await axios.post(`${API_CONFIG.baseUrl}/auth/session`, { transaction });
+        return response.data.data;
+      },
+    })
+  );
+}
+
 api.interceptors.response.use(
   (response) => response,
   (error) => {
@@ -31,6 +69,37 @@ api.interceptors.response.use(
     return Promise.reject(normalized);
   }
 );
+
+/**
+ * Turns a failed request into an English sentence for a live region.
+ *
+ * A failed load used to reach the user only as a toast, which disappears, and
+ * as a console entry, which does not reach them at all, so a page that failed
+ * to load simply stayed blank for a screen-reader user (issue #289). The status
+ * regions on the pages read this instead.
+ *
+ * The backend's own wording is preferred because it is the most specific thing
+ * available; this mirrors `describeVerifyError` in `payment-page-state.js`,
+ * which does the same for the verify endpoint.
+ */
+export function describeApiError(error: any, fallback = 'Something went wrong.'): string {
+  const serverMessage = error?.response?.data?.error;
+  if (typeof serverMessage === 'string' && serverMessage.trim()) {
+    return serverMessage;
+  }
+
+  if (error?.response?.status === 404) {
+    return 'Not found.';
+  }
+
+  const transportMessage = error?.message;
+  if (typeof transportMessage === 'string' && transportMessage.trim()) {
+    return transportMessage;
+  }
+
+  return fallback;
+}
+
 export const invoiceApi = USE_MOCK_API ? mockInvoiceApi : {
   create: async (data: {
     amount: number;
@@ -43,8 +112,15 @@ export const invoiceApi = USE_MOCK_API ? mockInvoiceApi : {
     sellerPublicKey?: string;
     sellerName?: string;
     sellerEmail?: string;
+    network?: string;
   }) => {
-    const response = await api.post('/invoices', data);
+    const normalizedAssetCode = data.assetCode ? data.assetCode.toUpperCase() : 'XLM';
+    // A retried submission must not create a second invoice (docs/IDEMPOTENCY.md).
+    const response = await api.post(
+      '/invoices',
+      { ...data, assetCode: normalizedAssetCode },
+      { headers: { 'Idempotency-Key': newIdempotencyKey() } }
+    );
     return response.data;
   },
 
@@ -72,18 +148,26 @@ export const invoiceApi = USE_MOCK_API ? mockInvoiceApi : {
     return response.data;
   },
 
-  cancel: async (id: string) => {
-    const response = await api.post(`/invoices/${id}/cancel`);
+  cancel: async (id: string, sellerPublicKey?: string) => {
+    const response = await api.post(
+      `/invoices/${id}/cancel`,
+      { sellerPublicKey },
+      { headers: { 'Idempotency-Key': newIdempotencyKey() } }
+    );
     return response.data;
   },
 
   verify: async (id: string, txHash: string, payerInfo?: { payerName?: string; payerEmail?: string }) => {
-    const response = await api.post(`/invoices/${id}/verify`, {
-      txHash,
-      // Lets the server reject a payment made on a different Stellar network.
-      network: process.env.NEXT_PUBLIC_STELLAR_NETWORK,
-      ...payerInfo
-    });
+    const response = await api.post(
+      `/invoices/${id}/verify`,
+      {
+        txHash,
+        // Lets the server reject a payment submitted from the wrong wallet network.
+        network: process.env.NEXT_PUBLIC_STELLAR_NETWORK,
+        ...payerInfo
+      },
+      { headers: { 'Idempotency-Key': newIdempotencyKey() } }
+    );
     return response.data;
   },
 
@@ -150,6 +234,6 @@ export const healthCheck = USE_MOCK_API ? mockHealthCheck : async () => {
   return response.data;
 };
 
-export { apiErrorMessage, isApiUnavailableError };
+export { apiErrorMessage, isApiUnavailableError, resolveVerificationError };
 
 export default api;

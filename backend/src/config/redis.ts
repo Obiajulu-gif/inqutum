@@ -17,13 +17,27 @@ export const redis = new Redis({
   },
 });
 
-redis.on('connect', () => {
-  console.log('✅ Redis connected');
-});
+  client.on('connect', () => {
+    console.log('✅ Redis connected');
+  });
 
-redis.on('error', (err) => {
-  console.error('❌ Redis error:', err);
-});
+  client.on('error', (err) => {
+    console.error('❌ Redis error:', err);
+  });
 
+  return client;
+}
+
+export async function createRedisClient(): Promise<Redis> {
+  const client = buildRedisClient();
+  try {
+    await client.connect();
+    return client;
+  } catch (error) {
+    client.disconnect();
+    throw error;
+  }
+}
+
+export const redis = buildRedisClient();
 export default redis;
-

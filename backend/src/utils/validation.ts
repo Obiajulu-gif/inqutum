@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import * as StellarSdk from '@stellar/stellar-sdk';
 import {
   DEFAULT_INVOICE_EXPIRY_DAYS,
   MAX_INVOICE_EXPIRY_DAYS,
@@ -12,6 +13,9 @@ import { sanitizePlainText } from '../security/content-safety';
 // payloads before they ever reach the InvoiceStorage layer, so the memory
 // and Postgres backends receive the same seller name/email, assetCode +
 // assetIssuer, customer name/email, expiresInDays and metadata fields.
+// Rejections are serialized through the shared failure envelope
+// (`{ success:false, error }`) from types/api.ts, matching the verify path's
+// `code` + `error` shape so every client reads one consistent contract.
 // Stellar public key validation
 export const stellarPublicKeySchema = z.string()
   .length(56)
@@ -45,12 +49,17 @@ export const createInvoiceSchema = z
     customerEmail: z.string().email().optional(),
     sellerName: plainText(255).optional(),
     sellerEmail: z.string().email().optional(),
+    network: z.enum(SUPPORTED_STELLAR_NETWORKS).optional(),
     expiresInDays: z.number()
       .int()
       .min(MIN_INVOICE_EXPIRY_DAYS)
       .max(MAX_INVOICE_EXPIRY_DAYS)
       .default(DEFAULT_INVOICE_EXPIRY_DAYS),
     sellerPublicKey: stellarPublicKeySchema,
+    // Import key. Also accepted on the create route so a caller can claim a key
+    // for a single invoice; updates stay limited to descriptive fields, so a
+    // claimed key can never rewrite amounts or ownership.
+    externalId: externalIdSchema.optional(),
   })
   .refine(
     (invoice) => !requiresIssuer(invoice.assetCode) || Boolean(invoice.assetIssuer),
@@ -76,11 +85,29 @@ export const paymentSchema = z.object({
   amount: z.number().positive(),
 });
 
+// Invoice cancellation schema
+export const cancelInvoiceSchema = z.object({
+  sellerPublicKey: stellarPublicKeySchema.optional(),
+});
+
 export type CreateInvoiceInput = z.infer<typeof createInvoiceSchema>;
 export type PaymentInput = z.infer<typeof paymentSchema>;
+export type CancelInvoiceInput = z.infer<typeof cancelInvoiceSchema>;
+
+/**
+ * One row of a bulk import file (issue #53).
+ *
+ * Deliberately the same schema as `createInvoiceSchema`, exported separately so
+ * the import pipeline and its tests can name the row type without implying a
+ * different validation contract. An imported row can therefore never name an
+ * asset, amount or seller the create endpoint would have rejected.
+ */
+export const importRowSchema = createInvoiceSchema;
+export type ImportRow = z.infer<typeof importRowSchema>;
 
 export default {
   createInvoiceSchema,
   paymentSchema,
+  cancelInvoiceSchema,
   stellarPublicKeySchema,
 };

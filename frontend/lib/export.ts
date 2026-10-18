@@ -3,6 +3,16 @@ import {
   assertPaymentProofAvailable,
   canExportPaymentProof,
 } from './payment-proof-policy.js';
+import {
+  buildInvoiceMailto,
+  buildProofMailto,
+  canSendInvoiceEmail,
+  canSendProofEmail,
+  getInvoiceMailtoRecipient,
+  getProofMailtoRecipient,
+  openInvoiceMailto,
+  openProofMailto,
+} from './mailto-delivery.js';
 
 import {
   PRINT_DOCUMENT_CSP,
@@ -30,6 +40,11 @@ export interface Invoice {
   createdAt: string;
   expiresAt: string;
   paidAt?: string;
+  cancelledAt?: string;
+  settledAt?: string;
+  settlementContext?: 'ON_TIME' | 'AFTER_EXPIRY' | 'AFTER_CANCEL';
+  priorStatus?: string;
+  latePaymentWarningCode?: 'PAYMENT_RECEIVED_AFTER_EXPIRY' | 'PAYMENT_RECEIVED_AFTER_CANCEL';
   memo: string;
   sellerPublicKey: string;
   payerPublicKey?: string;
@@ -157,6 +172,7 @@ export function generateInvoicePDF(invoice: Invoice): string {
   const network =
     process.env.NEXT_PUBLIC_STELLAR_NETWORK === 'TESTNET' ? 'Testnet' : 'Mainnet';
   const isPaid = invoice.status === 'PAID';
+  const warning = latePaymentWarning(invoice);
 
   const rawId = invoice.id || '';
   const displayId = rawId.substring(0, 8).toUpperCase();
@@ -324,6 +340,19 @@ export function generateInvoicePDF(invoice: Invoice): string {
       font-size: 11px; 
       color: #92400e; 
       line-height: 1.4; 
+    }
+    .late-warning {
+      background: #fffbeb;
+      border: 1px solid #fbbf24;
+      border-left: 3px solid #d97706;
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 15px;
+    }
+    .late-warning p {
+      font-size: 10px;
+      color: #92400e;
+      line-height: 1.4;
     }
   </style>
 </head>

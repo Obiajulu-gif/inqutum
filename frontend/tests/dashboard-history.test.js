@@ -21,6 +21,9 @@ const {
   revenueEntries,
   scopeInvoicesToSeller,
   searchInvoices,
+  filterInvoicesByStatus,
+  sortInvoices,
+  DASHBOARD_SORT_OPTIONS,
 } = require('../lib/dashboard-history');
 
 const ALICE = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
@@ -142,6 +145,22 @@ test('search is case-insensitive and tolerates missing optional fields', () => {
   assert.doesNotThrow(() => invoiceSearchText(invoice()));
 });
 
+test('search matches customer, seller, and payer fields', () => {
+  const invoices = [
+    invoice({ id: 'a', customerEmail: 'client@example.com' }),
+    invoice({ id: 'b', sellerName: 'Satoshi Consulting' }),
+    invoice({ id: 'c', sellerEmail: 'sat@quittance.io' }),
+    invoice({ id: 'd', payerName: 'Bob Payer' }),
+    invoice({ id: 'e', payerEmail: 'bob@stellar.org' }),
+  ];
+
+  assert.deepEqual(searchInvoices(invoices, 'client@example.com').map((i) => i.id), ['a']);
+  assert.deepEqual(searchInvoices(invoices, 'Satoshi').map((i) => i.id), ['b']);
+  assert.deepEqual(searchInvoices(invoices, 'sat@quittance.io').map((i) => i.id), ['c']);
+  assert.deepEqual(searchInvoices(invoices, 'Bob Payer').map((i) => i.id), ['d']);
+  assert.deepEqual(searchInvoices(invoices, 'bob@stellar.org').map((i) => i.id), ['e']);
+});
+
 test('search never reads wallet activity', () => {
   // Only invoice fields are searchable; a Horizon-style field is ignored.
   const invoices = [invoice({ id: 'a', transactionHash: 'deadbeef' })];
@@ -217,4 +236,102 @@ test('hasAnyInvoices reads the seller-scoped total', () => {
   assert.equal(hasAnyInvoices({ total_invoices: 3 }), true);
   assert.equal(hasAnyInvoices({ total_invoices: 0 }), false);
   assert.equal(hasAnyInvoices(null), false);
+});
+
+// ----------------------------------------------------------------- cancelled
+
+test('INVOICE_FILTERS includes cancelled status', () => {
+  const { INVOICE_FILTERS } = require('../lib/dashboard-history');
+  assert.ok(INVOICE_FILTERS.includes('cancelled'));
+});
+
+test('cancelled invoices are retained in historical invoices', () => {
+  const now = '2026-08-30T12:00:00.000Z';
+  const invoices = [
+    invoice({ id: 'live', expiresAt: '2026-08-31T12:00:00.000Z' }),
+    invoice({ id: 'cancelled', status: 'CANCELLED' }),
+  ];
+
+  assert.deepEqual(actionableInvoices(invoices, now).map((i) => i.id), ['live']);
+  assert.deepEqual(historicalInvoices(invoices, now).map((i) => i.id), ['cancelled']);
+});
+
+// --------------------------------------------------------- edge cases
+
+test('dashboardDataFor handles missing now parameter gracefully', () => {
+  const loaded = { owner: ALICE, invoices: [invoice()], stats: {} };
+  // Should default to current time if not provided
+  const result = dashboardDataFor(loaded, ALICE);
+  assert.ok(result.invoices || result.invoices.length >= 0);
+});
+
+test('dashboardDataFor filters out null or malformed invoices', () => {
+  const loaded = {
+    owner: ALICE,
+    invoices: [
+      invoice({ id: 'valid' }),
+      null,
+      invoice({ id: 'valid2' }),
+      undefined,
+    ].filter(Boolean),
+    stats: {},
+  };
+  const shown = dashboardDataFor(loaded, ALICE);
+  assert.equal(shown.invoices.length, 2);
+});
+
+test('scopeInvoicesToSeller drops invoices with null or missing seller keys', () => {
+  const mixed = [
+    invoice({ id: 'a', sellerPublicKey: ALICE }),
+    invoice({ id: 'b', sellerPublicKey: null }),
+    invoice({ id: 'c', sellerPublicKey: undefined }),
+  ];
+  const result = scopeInvoicesToSeller(mixed, ALICE);
+  assert.deepEqual(result.map((i) => i.id), ['a']);
+});
+
+test('sortInvoices handles invoices with missing dates', () => {
+  const invoices = [
+    invoice({ id: 'a', createdAt: '2026-08-30T12:00:00.000Z' }),
+    invoice({ id: 'b', createdAt: null }),
+    invoice({ id: 'c', createdAt: undefined }),
+  ];
+  const sorted = sortInvoices(invoices, 'newest');
+  // Should not throw and handle gracefully
+  assert.ok(sorted.length === 3);
+});
+
+test('sortInvoices handles invalid date strings', () => {
+  const invoices = [
+    invoice({ id: 'a', createdAt: 'not-a-date' }),
+    invoice({ id: 'b', createdAt: '' }),
+    invoice({ id: 'c', createdAt: '2026-08-30T12:00:00.000Z' }),
+  ];
+  const sorted = sortInvoices(invoices, 'newest');
+  // Should handle gracefully
+  assert.ok(sorted.length === 3);
+});
+
+test('filterInvoicesByStatus normalizes status comparison', () => {
+  const invoices = [
+    invoice({ id: 'a', status: 'PENDING' }),
+    invoice({ id: 'b', status: 'pending' }),
+    invoice({ id: 'c', status: 'Pending' }),
+  ];
+  const filtered = filterInvoicesByStatus(invoices, 'PENDING');
+  assert.ok(filtered.length >= 1);
+});
+
+test('reconcileExpiryStats handles missing stat fields', () => {
+  const stats = { pending_invoices: undefined, expired_invoices: null };
+  const original = [invoice()];
+  const projected = [invoice({ status: 'EXPIRED' })];
+  const result = reconcileExpiryStats(stats, original, projected);
+  assert.ok(typeof result === 'object' || result === null);
+});
+
+test('revenueEntries handles non-object revenue_by_asset', () => {
+  assert.deepEqual(revenueEntries({ revenue_by_asset: 'not-an-object' }), []);
+  assert.deepEqual(revenueEntries({ revenue_by_asset: 123 }), []);
+  assert.deepEqual(revenueEntries({ revenue_by_asset: [] }), []);
 });

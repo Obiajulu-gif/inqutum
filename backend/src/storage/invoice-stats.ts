@@ -90,7 +90,7 @@ export function calculateInvoiceStats(
       });
     });
 
-  const pendingInvoices = invoices.filter(invoice => invoice.status === 'PENDING').length;
+  const pendingInvoices = invoices.filter(isPendingInvoice).length;
 
   return {
     total_invoices: invoices.length,

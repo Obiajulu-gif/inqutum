@@ -1,7 +1,8 @@
 'use client';
 
+import { useState, useEffect } from 'react';
 import { useParams } from 'next/navigation';
-import { Loader2 } from 'lucide-react';
+import { Loader2, AlertTriangle } from 'lucide-react';
 import { toast } from 'sonner';
 import PayPageHeader from '@/components/PayPageHeader';
 import PayAmountBlock from '@/components/PayAmountBlock';
@@ -13,22 +14,51 @@ import PayStatusRegion from '@/components/PayStatusRegion';
 import QRCodeDisplay from '@/components/QRCodeDisplay';
 import PaymentButton from '@/components/PaymentButton';
 import WalletConnect from '@/components/WalletConnect';
+import FreighterInstallPrompt from '@/components/FreighterInstallPrompt';
+import MobilePaymentFallback from '@/components/MobilePaymentFallback';
 import ApiErrorState from '@/components/ApiErrorState';
-import { copyToClipboard } from '@/lib/utils';
+import { detectDeviceContext } from '@/lib/mobile-detection';
+import { copyToClipboard, formatAmount } from '@/lib/utils';
 import { openInvoicePDF, shareInvoiceByEmail } from '@/lib/export';
-import { getPayPageView } from '@/lib/payment-page-state';
+import { getPayPageView, getPayPageWalletGate } from '@/lib/payment-page-state';
+import { memoPaymentHint } from '@/lib/pay-memo-hint';
 import { PAYMENT_STATUS_POLL_INTERVAL_MS } from '@/lib/api';
+// Payment and verification errors on the pay page resolve through the shared
+// canonical rejection code table, ensuring consistent English copy across all views.
 import { usePaymentPage } from '@/lib/use-payment-page';
+import { MAIN_CONTENT_ID, describeAmount, statusText } from '@/lib/a11y';
+import { useWalletStore } from '@/lib/store';
+import { EXPECTED_WALLET_NETWORK, NETWORK_DISPLAY_NAME } from '@/lib/stellar';
+import { detectDevice } from '@/lib/mobile-detection';
 
 export default function PaymentPage() {
   const id = useParams().id as string;
   const page = usePaymentPage(id);
+  const walletSession = useWalletStore();
+  const isWrongNetwork = useWalletStore((s) => s.isWrongNetwork);
+  const [isMobile, setIsMobile] = useState(false);
+  const [showDesktopWalletAnyway, setShowDesktopWalletAnyway] = useState(false);
+
+  useEffect(() => {
+    setIsMobile(detectDevice().isMobile);
+  }, []);
 
   if (page.loading) {
     return (
-      <PageMessage>
-        <Loader2 className="w-16 h-16 animate-spin text-cyan-400" />
-      </PageMessage>
+      <main
+        id={MAIN_CONTENT_ID}
+        tabIndex={-1}
+        className="min-h-screen bg-logo-pattern relative flex items-center justify-center"
+      >
+        <div className="orb orb-1"></div>
+        <div className="orb orb-2"></div>
+        <div className="orb orb-3"></div>
+        <div className="relative" role="status" aria-live="polite">
+          <div className="absolute inset-0 bg-gradient-to-r from-cyan-400 to-blue-500 rounded-full blur-2xl opacity-30"></div>
+          <Loader2 className="w-16 h-16 animate-spin text-teal-800 relative z-10" aria-hidden="true" />
+          <span className="sr-only">Loading this invoice.</span>
+        </div>
+      </main>
     );
   }
 
@@ -51,6 +81,11 @@ export default function PaymentPage() {
 
   const invoice = page.invoice;
   const view = getPayPageView(invoice);
+  const walletPaymentGate = getPayPageWalletGate(
+    invoice,
+    walletSession,
+    EXPECTED_WALLET_NETWORK
+  );
   const copy = async (value: string, label: string) => {
     if (await copyToClipboard(value)) toast.success(`${label} copied`);
   };
@@ -59,16 +94,24 @@ export default function PaymentPage() {
     toast.success('Opening payment proof');
   };
   const email = () => {
-    if (!invoice.customerEmail) return toast.error('No client email on this invoice');
-    shareInvoiceByEmail(invoice);
+    try {
+      if (invoice.status === 'PAID') {
+        emailPaymentProof(invoice);
+      } else {
+        shareInvoiceByEmail(invoice);
+      }
+      toast.success('Opening email client');
+    } catch (err: any) {
+      toast.error(err?.message || 'No recipient email on this invoice');
+    }
   };
+
+  const amountLabel = describeAmount(formatAmount(invoice.amount, 7), invoice.assetCode);
 
   return (
     <main id="main-content" className="min-h-screen bg-logo-pattern relative py-8 sm:py-12 px-4">
       <PayPageHeader
         wallet={page.wallet}
-        onConnect={page.setWallet}
-        onDisconnect={() => page.setWallet(null)}
       />
       <div className="max-w-4xl mx-auto relative z-10 pt-20">
         <PayStatusRegion state={page.paymentState} />
@@ -177,9 +220,195 @@ export default function PaymentPage() {
   );
 }
 
-function PageMessage({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="min-h-[12rem] card flex items-center justify-center text-center">{children}</div>
+          <div className="mb-6">
+            <PaymentResultPanel state={page.payment} />
+          </div>
+
+          {invoice.assetCode && invoice.assetCode !== 'XLM' && view.showPaymentControls && (
+            <div className="mb-6 bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm text-blue-900 flex items-start gap-3">
+              <div>
+                <span className="font-semibold block mb-0.5">{invoice.assetCode} Trustline Notice</span>
+                <span>Please ensure your Stellar wallet has established a trustline for {invoice.assetCode} before submitting payment.</span>
+              </div>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 sm:gap-8">
+            <div className="space-y-6">
+              <PayAmountBlock invoice={invoice} />
+              <PayMemoBlock invoice={invoice} onCopy={copy} />
+              <p className="text-xs text-gray-600">
+                {memoPaymentHint(invoice.memo)}
+              </p>
+            </div>
+            <div className="space-y-6">
+              {view.showProof && (
+                <PayProofPanel invoice={invoice} onDownload={download} onEmail={email} />
+              )}
+              {view.expired && (
+                <div className="card text-center py-8">
+                  <div className="inline-flex items-center justify-center w-20 h-20 bg-red-100 rounded-full mb-4">
+                    <svg className="w-12 h-12 text-red-700" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </div>
+                  <h3 className="text-2xl font-bold text-red-700 mb-2">Payment Expired</h3>
+                  <p className="text-gray-700">
+                    {statusText('EXPIRED').description}
+                  </p>
+                </div>
+              )}
+              {view.cancelled && (
+                <div className="card text-center py-8">
+                  <div className="inline-flex items-center justify-center w-20 h-20 bg-gray-100 rounded-full mb-4">
+                    <svg className="w-12 h-12 text-gray-700" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </div>
+                  <h3 className="text-2xl font-bold text-gray-700 mb-2">Invoice Cancelled</h3>
+                  <p className="text-gray-700">
+                    {statusText('CANCELLED').description}
+                  </p>
+                </div>
+              )}
+              {view.showPaymentControls && (
+                <>
+                  <section aria-label="Stellar payment QR code" className="card text-center">
+                    <h3 className="text-lg font-semibold mb-4">Scan QR Code</h3>
+                    <QRCodeDisplay
+                      value={page.paymentInfo?.stellarQrCode || page.paymentInfo?.paymentUrl || ''}
+                      title=""
+                      size={220}
+                      description={`a request to pay ${amountLabel} with memo ${invoice.memo}`}
+                    />
+                    <p className="text-sm text-gray-700 text-center mt-4">
+                      Scan with your Stellar wallet app to pay instantly
+                    </p>
+                  </section>
+                  {isMobile && !showDesktopWalletAnyway ? (
+                    <div className="space-y-4">
+                      <MobilePaymentFallback
+                        destination={invoice.sellerPublicKey}
+                        amount={String(invoice.amount)}
+                        assetCode={invoice.assetCode}
+                        assetIssuer={invoice.assetIssuer}
+                        memo={invoice.memo}
+                        paymentUrl={
+                          page.paymentInfo?.paymentUrl ||
+                          (typeof window !== 'undefined' ? window.location.href : '')
+                        }
+                        onCopy={(text, label) => {
+                          page.dispatch({ type: 'COPIED', key: label });
+                        }}
+                      />
+                      <div className="text-center">
+                        <button
+                          type="button"
+                          onClick={() => setShowDesktopWalletAnyway(true)}
+                          className="text-xs text-gray-500 hover:text-gray-700 underline"
+                        >
+                          Show desktop extension controls
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <section aria-labelledby="wallet-pay-title" className="card">
+                      <h3 id="wallet-pay-title" className="text-xl font-semibold text-center mb-4">
+                        Pay with Wallet
+                      </h3>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+                        <PayerField
+                          id="payer-name"
+                          label="Your name (optional)"
+                          value={page.payerName}
+                          onChange={page.setPayerName}
+                        />
+                        <PayerField
+                          id="payer-email"
+                          label="Your email (optional)"
+                          value={page.payerEmail}
+                          onChange={page.setPayerEmail}
+                          type="email"
+                        />
+                      </div>
+                      <div className="flex justify-center mb-4">
+                        <WalletConnect />
+                      </div>
+                      {!walletPaymentGate.ready && walletPaymentGate.action !== 'none' && (
+                        <FreighterInstallPrompt
+                          gate={walletPaymentGate}
+                          action={<WalletConnect />}
+                          compact
+                          className="mb-4"
+                        />
+                      )}
+                      {walletPaymentGate.ready && isWrongNetwork && (
+                        <div
+                          role="alert"
+                          className="mb-4 p-4 bg-amber-50 border border-amber-300 rounded-xl flex items-center gap-3 text-sm text-amber-900"
+                        >
+                          <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" aria-hidden="true" />
+                          <div>
+                            <p className="font-semibold">Wrong Stellar Network</p>
+                            <p className="mt-0.5 text-xs text-amber-800">
+                              Your wallet is connected to a different network. Please switch to {NETWORK_DISPLAY_NAME} in Freighter, then reconnect to pay.
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                      {!(isWrongNetwork && walletPaymentGate.ready) && (
+                      <>
+                      <PaymentButton
+                        destination={invoice.sellerPublicKey}
+                        amount={String(invoice.amount)}
+                        memo={invoice.memo}
+                        assetCode={invoice.assetCode}
+                        assetIssuer={invoice.assetIssuer}
+                        invoiceId={invoice.id}
+                        payerName={page.payerName}
+                        payerEmail={page.payerEmail}
+                        invoiceStatus={view.expired ? 'EXPIRED' : invoice.status}
+                        onStart={() => page.dispatch({ type: 'PAY_STARTED' })}
+                        onSuccess={(txHash) => {
+                          page.dispatch({ type: 'PAY_SENT', txHash });
+                          void page.reload();
+                        }}
+                        onError={(error) => page.dispatch({ type: 'PAY_FAILED', error })}
+                      />
+                      {isMobile && showDesktopWalletAnyway && (
+                        <div className="mt-4 text-center">
+                          <button
+                            type="button"
+                            onClick={() => setShowDesktopWalletAnyway(false)}
+                            className="text-xs text-gray-500 hover:text-gray-700 underline"
+                          >
+                            Return to mobile guidance
+                          </button>
+                        </div>
+                      )}
+                      </>
+                      )}
+                    </section>
+                  )}
+                  <PayMonitorPanel
+                    active={page.monitoring}
+                    intervalMs={
+                      page.paymentInfo?.statusPollingIntervalMs ?? PAYMENT_STATUS_POLL_INTERVAL_MS
+                    }
+                  />
+                  <PayVerifyPanel
+                    txHash={page.txHash}
+                    verifying={page.verifying}
+                    onChange={page.setTxHash}
+                    onVerify={() => void page.verify()}
+                  />
+                </>
+              )}
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
   );
 }
 

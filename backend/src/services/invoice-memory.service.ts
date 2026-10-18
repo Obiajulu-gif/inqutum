@@ -1,41 +1,84 @@
+import { MemoCollisionError } from '../domain/payment-attribution';
 import { generateInvoiceMemo } from '../utils/memo';
+import { generatePublicInvoiceId } from '../utils/memory-public-id';
 import { CreateInvoiceInput } from '../utils/validation';
-import memoryStorage, { MemoryStorage } from '../storage/memory-storage';
+import memoryStorage, { MemoryStorage, MemoryPaymentEvent } from '../storage/memory-storage';
 import { calculateInvoiceExpiry } from '../domain/invoice-expiry';
 import type { StoredInvoice } from '../storage/invoice-storage';
 import { compareNewestFirst, isAfterCursor, type InvoiceCursor } from '../storage/invoice-cursor';
 import type { InvoiceStats } from '../storage/invoice-stats';
-import type { PayerInfo } from '../storage/invoice-storage';
+import type { ReconciliationInvoice } from '../domain/reconciliation';
+import type { MarkAsPaidOptions, PayerInfo } from '../storage/invoice-storage';
+
+/**
+ * How many times invoice creation re-draws a memo before giving up.
+ *
+ * A collision means another live invoice already holds that memo, which is how
+ * one on-chain payment could otherwise be made to satisfy two invoices. Against
+ * a per-millisecond random suffix a second draw is already generous; the point
+ * of the bound is to fail loudly instead of looping.
+ */
+const MEMO_DRAW_ATTEMPTS = 3;
 
 export class InvoiceMemoryService {
-  constructor(private readonly storage: MemoryStorage = memoryStorage) {}
+  constructor(
+    private readonly storage: MemoryStorage = memoryStorage,
+    /** Injectable so the collision path is testable without waiting for one. */
+    private readonly nextMemo: () => string = generateInvoiceMemo
+  ) {}
 
   async createInvoice(input: CreateInvoiceInput): Promise<StoredInvoice> {
     if (!input.sellerPublicKey) {
       throw new Error('Seller public key is required');
     }
 
-    const memo = generateInvoiceMemo();
+    const id = generatePublicInvoiceId();
+    const memo = this.drawUnusedMemo();
     const expiresAt = calculateInvoiceExpiry(input.expiresInDays);
 
     const invoice = this.storage.createInvoice({
+      id,
       sellerPublicKey: input.sellerPublicKey,
       sellerName: input.sellerName,
       sellerEmail: input.sellerEmail,
       amount: input.amount,
-      assetCode: input.assetCode || 'XLM',
+      assetCode: (input.assetCode || 'XLM').toUpperCase(),
       assetIssuer: input.assetIssuer,
       memo,
       description: input.description,
       customerName: input.customerName,
       customerEmail: input.customerEmail,
       expiresAt,
+      externalId: input.externalId,
     });
 
     if (process.env.NODE_ENV !== 'test') {
       console.log('✅ Invoice created:', invoice.id);
     }
     return invoice;
+  }
+
+  /**
+   * Draw a memo no live invoice holds. Throws rather than returning a memo that
+   * is already taken: two invoices sharing one memo cannot be told apart by the
+   * payment monitor, so this is a refusal to create, not a warning.
+   */
+  private drawUnusedMemo(): string {
+    let candidate = this.nextMemo();
+
+    for (
+      let attempt = 1;
+      attempt < MEMO_DRAW_ATTEMPTS && this.storage.hasMemo(candidate);
+      attempt++
+    ) {
+      candidate = this.nextMemo();
+    }
+
+    if (this.storage.hasMemo(candidate)) {
+      throw new MemoCollisionError(candidate);
+    }
+
+    return candidate;
   }
 
   async getInvoiceById(id: string): Promise<StoredInvoice | null> {
@@ -45,6 +88,30 @@ export class InvoiceMemoryService {
 
   async getInvoiceByMemo(memo: string): Promise<StoredInvoice | null> {
     const invoice = this.storage.getInvoiceByMemo(memo);
+    return invoice ?? null;
+  }
+
+  /**
+   * Read-only import-key lookup (issue #53). Must not apply the lazy expiry
+   * transition, or an import dry run would write to storage.
+   */
+  async getInvoiceByExternalId(externalId: string): Promise<StoredInvoice | null> {
+    const invoice = this.storage.getInvoiceByExternalId(externalId);
+    return invoice ?? null;
+  }
+
+  /** Descriptive-field patch only (issue #53); mirrors the Postgres backend. */
+  async updateInvoiceMutableFields(
+    id: string,
+    patch: {
+      description?: string;
+      customerName?: string;
+      customerEmail?: string;
+      sellerName?: string;
+      sellerEmail?: string;
+    }
+  ): Promise<StoredInvoice | null> {
+    const invoice = this.storage.updateInvoiceMutableFields(id, patch);
     return invoice ?? null;
   }
 
@@ -58,7 +125,7 @@ export class InvoiceMemoryService {
     const invoice = this.storage.markAsPaid(invoiceId, txHash, payerPublicKey, payerInfo, expectedVersion);
 
     if (!invoice) {
-      throw new Error('Invoice not found, expired, or already processed');
+      throw new Error('Invoice not found');
     }
 
     console.log('✅ Invoice marked as paid:', invoiceId);
@@ -93,7 +160,7 @@ export class InvoiceMemoryService {
 
     const updated = this.storage.updateInvoice(invoiceId, { status: 'CANCELLED' }, expectedVersion);
     if (!updated) {
-      throw new Error('Invoice not found or already processed');
+      throw new Error('Invoice not found');
     }
     return updated;
   }
