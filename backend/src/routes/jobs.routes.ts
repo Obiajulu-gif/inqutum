@@ -2,6 +2,7 @@ import { NextFunction, Request, Response, Router } from 'express';
 import { timingSafeEqual } from 'crypto';
 import { Job, JobStatus, JobStore } from '../jobs/job-types';
 import { auditStore } from '../audit/audit-service';
+import { DeadLetterOperator } from '../jobs/dead-letter-operator';
 
 const STATUSES: JobStatus[] = ['queued', 'running', 'succeeded', 'dead'];
 
@@ -43,6 +44,7 @@ const view = (job: Job) => job;
  */
 export function createJobsRouter(options: JobsRouterOptions): Router {
   const router = Router();
+  const deadLetters = new DeadLetterOperator(options.store);
   router.use('/jobs', requireAdmin(options.adminToken));
 
   router.get('/jobs', async (req, res, next) => {
@@ -56,7 +58,9 @@ export function createJobsRouter(options: JobsRouterOptions): Router {
       const type = typeof req.query.type === 'string' ? req.query.type : undefined;
 
       const [{ jobs, total }, counts] = await Promise.all([
-        options.store.list({ status: status as JobStatus | undefined, type, limit, offset }),
+        status === 'dead'
+          ? deadLetters.inspect({ id: 'jobs-admin', role: 'admin' }, { type, limit, offset })
+          : options.store.list({ status: status as JobStatus | undefined, type, limit, offset }),
         options.store.counts(),
       ]);
       res.json({ success: true, data: { jobs: jobs.map(view), total, limit, offset, counts }, correlationId: req.correlationId });
@@ -77,10 +81,7 @@ export function createJobsRouter(options: JobsRouterOptions): Router {
 
   router.post('/jobs/:id/retry', async (req, res, next) => {
     try {
-      const job = await options.store.requeueDead(req.params.id, new Date());
-      if (!job) {
-        return res.status(409).json({ success: false, code: 'JOB_NOT_DEAD', error: 'Only dead-lettered jobs can be retried', correlationId: req.correlationId });
-      }
+      const job = await deadLetters.retry({ id: 'jobs-admin', role: 'admin' }, req.params.id, new Date());
       auditStore.recordEvent({
         action: 'MAINTAINER_ACTION',
         actor: { type: 'maintainer', id: 'jobs-admin' },
@@ -91,6 +92,9 @@ export function createJobsRouter(options: JobsRouterOptions): Router {
       });
       res.json({ success: true, data: view(job), correlationId: req.correlationId });
     } catch (err) {
+      if (err instanceof Error && /^Job .* is not dead-lettered/.test(err.message)) {
+        return res.status(409).json({ success: false, code: 'JOB_NOT_DEAD', error: 'Only dead-lettered jobs can be retried', correlationId: req.correlationId });
+      }
       next(err);
     }
   });
