@@ -3,21 +3,17 @@ import stellarService, { PaymentPageRecord, PaymentRecord } from './stellar.serv
 import invoiceService, { InvoiceService, Queryable } from './invoice.service';
 import { SELLER_PUBLIC_KEY, STELLAR_NETWORK } from '../config/stellar';
 import { pool } from '../config/database';
-import { checkInvoiceIsPayable, checkTxHash } from './payment-verification';
-
-export function isUsablePaymentRecord(payment: Partial<PaymentRecord> | null | undefined): payment is PaymentRecord {
-  return Boolean(
-    payment &&
-    checkTxHash(payment.txHash).ok &&
-    typeof payment.from === 'string' &&
-    typeof payment.to === 'string' &&
-    typeof payment.assetCode === 'string' &&
-    payment.assetCode.length > 0 &&
-    typeof payment.amount === 'string' &&
-    /^(?:0|[1-9]\d*)(?:\.\d{1,7})?$/.test(payment.amount.trim()) &&
-    Number(payment.amount) > 0
-  );
-}
+import { checkInvoiceIsPayable, verifyHorizonPayment } from './payment-verification';
+import {
+  parseSettlementTime,
+  SettlementTimeUnavailableError,
+} from '../domain/invoice-settlement';
+import { monitorBackoffMs } from '../utils/monitor-retry-backoff';
+import {
+  FilePaymentMonitorCheckpointStore,
+  PaymentMonitorCheckpointStore,
+  PostgresPaymentMonitorCheckpointStore,
+} from './payment-monitor-checkpoint';
 
 export interface PaymentPageSource {
   getPaymentsPage(account: string, cursor: string, limit: number): Promise<PaymentPageRecord[]>;
@@ -126,15 +122,13 @@ export class PaymentMonitorService {
     if (this.isRunning) return;
     if (!this.account) throw new Error('Payment monitor requires SELLER_PUBLIC_KEY');
     this.isRunning = true;
-
-    // Start streaming payments
-    this.closeHandler = stellarService.streamPayments(
-      SELLER_PUBLIC_KEY,
-      this.handlePayment.bind(this),
-      this.handleError.bind(this)
-    );
-
-    console.log('✅ Payment monitor started successfully');
+    this.snapshot = { state: 'starting', account: this.account, consecutiveFailures: 0 };
+    this.expirationTimer = setInterval(() => {
+      void this.invoices.markExpiredInvoices().catch((error) => {
+        console.error('Error checking expired invoices:', error);
+      });
+    }, 60_000);
+    this.schedule(0);
   }
 
   stop() {
@@ -277,115 +271,9 @@ export class PaymentMonitorService {
       throw new SettlementTimeUnavailableError();
     }
 
-    this.isRunning = false;
-    console.log('✅ Payment monitor stopped');
-  }
-
-  /**
-   * Handle incoming payment
-   */
-  private async handlePayment(payment: PaymentRecord) {
-    try {
-      if (!isUsablePaymentRecord(payment)) {
-        console.warn('⚠️ Invalid payment record, skipping:', (payment as Partial<PaymentRecord>)?.txHash);
-        return;
-      }
-
-      console.log('🔍 Processing payment:', payment.txHash);
-
-      // Check if payment has a memo
-      if (!payment.memo) {
-        console.log('⚠️ Payment without memo, skipping:', payment.txHash);
-        return;
-      }
-
-      // Find invoice by memo
-      const invoice = await invoiceService.getInvoiceByMemo(payment.memo);
-
-      if (!invoice) {
-        console.log('⚠️ No invoice found for memo:', payment.memo);
-        return;
-      }
-
-      // The lazy read persists expiration before the monitor can pay it. Use
-      // the same stable code/message returned by the verify endpoint.
-      const payable = checkInvoiceIsPayable(invoice.status);
-      if (!payable.ok) {
-        console.log(`⚠️ ${payable.code}: ${payable.error}`, invoice.id);
-        return;
-      }
-
-      // Verify payment amount
-      const expectedAmount = invoice.amount.toFixed(7);
-      const receivedAmount = parseFloat(payment.amount).toFixed(7);
-
-      if (expectedAmount !== receivedAmount) {
-        console.log('⚠️ Amount mismatch:', {
-          expected: expectedAmount,
-          received: receivedAmount,
-          invoiceId: invoice.id,
-        });
-
-        // Log the partial payment attempt
-        await invoiceService.logPaymentEvent(invoice.id, 'PARTIAL_PAYMENT', {
-          txHash: payment.txHash,
-          expectedAmount,
-          receivedAmount,
-          payerPublicKey: payment.from,
-        });
-
-        return;
-      }
-
-      // Verify asset
-      if (payment.assetCode !== invoice.assetCode) {
-        console.log('⚠️ Asset mismatch:', {
-          expected: invoice.assetCode,
-          received: payment.assetCode,
-          invoiceId: invoice.id,
-        });
-        return;
-      }
-
-      // Save transaction to database
-      await this.saveTransaction(payment, invoice.id);
-
-      // Mark invoice as paid
-      await invoiceService.markAsPaid(invoice.id, payment.txHash, payment.from);
-
-      console.log('✅ Payment processed successfully:', {
-        invoiceId: invoice.id,
-        txHash: payment.txHash,
-        amount: payment.amount,
-      });
-
-      // TODO: Send notification to customer/seller
-      // await this.sendPaymentNotification(invoice, payment);
-
-    } catch (error: any) {
-      console.error('❌ Error processing payment:', error);
-    }
-  }
-
-  /**
-   * Save transaction to database
-   */
-  private async saveTransaction(payment: PaymentRecord, invoiceId: string) {
-    const query = `
-      INSERT INTO transactions (
-        invoice_id, from_address, to_address, amount, asset_code, asset_issuer,
-        tx_hash, memo, ledger, processed_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-      ON CONFLICT (tx_hash) DO NOTHING
-    `;
-
-    const values = [
-      invoiceId,
-      payment.from,
-      payment.to,
-      payment.amount,
-      payment.assetCode,
-      payment.assetIssuer || null,
+    await this.saveTransaction(payment, invoice.id);
+    await this.invoices.markAsPaid(
+      invoice.id,
       payment.txHash,
       payment.from,
       undefined,
@@ -393,28 +281,9 @@ export class PaymentMonitorService {
     );
   }
 
-  /**
-   * Handle stream errors
-   */
-  private handleError(error: Error) {
-    console.error('❌ Payment stream error:', error);
-    
-    // Attempt to restart after delay
-    setTimeout(() => {
-      if (this.isRunning) {
-        console.log('🔄 Attempting to restart payment stream...');
-        this.stop();
-        this.start();
-      }
-    }, 5000);
-  }
-
-  /**
-   * Manual sync - fetch recent payments and process them
-   */
-  async manualSync(limit: number = 50) {
-    if (!SELLER_PUBLIC_KEY) {
-      throw new Error('Payment sync requires SELLER_PUBLIC_KEY to be configured');
+  private async saveTransaction(payment: PaymentRecord, invoiceId: string) {
+    if (!this.database) {
+      return;
     }
     try {
       await this.database.query(

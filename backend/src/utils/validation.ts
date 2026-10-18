@@ -6,6 +6,7 @@ import {
   MIN_INVOICE_EXPIRY_DAYS,
 } from '../domain/invoice-expiry';
 import { NATIVE_ASSET_CODE, requiresIssuer } from './asset-helpers';
+import { SUPPORTED_STELLAR_NETWORKS } from '../config/stellar';
 import { DEFAULT_POLICY } from '../domain/policy';
 import { sanitizePlainText } from '../security/content-safety';
 

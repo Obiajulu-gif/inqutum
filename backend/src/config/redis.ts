@@ -3,19 +3,18 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const parsedPort = parseInt(process.env.REDIS_PORT || '6379', 10);
-const redisPort = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : 6379;
-const redisHost = (process.env.REDIS_HOST || 'localhost').trim();
-
-export const redis = new Redis({
-  host: redisHost,
-  port: redisPort,
-  maxRetriesPerRequest: null,
-  retryStrategy(times) {
-    const delay = Math.min(times * 50, 2000);
-    return delay;
-  },
-});
+function buildRedisClient(): Redis {
+  const client = new Redis({
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT || '6379'),
+    lazyConnect: true,
+    enableOfflineQueue: false,
+    maxRetriesPerRequest: 1,
+    retryStrategy(times) {
+      if (times > 1) return null;
+      return Math.min(times * 50, 200);
+    },
+  });
 
   client.on('connect', () => {
     console.log('✅ Redis connected');
